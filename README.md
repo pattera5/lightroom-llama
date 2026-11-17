@@ -22,8 +22,8 @@
 - Runs entirely on your own computer: no internet required, and your photos aren't uploaded anywhere
 - **Single-photo mode** to review and edit the results before saving
 - **Batch mode** to caption many photos in one run, with a progress bar and cancel
-- **Uses what you already know about a photo:** existing title, caption and keywords are given to the model as facts, so captions name the right people, places and events
-- **Keeps your keyword list tidy:** reuses your existing keywords and merges near-duplicates such as "outdoor", "outdoors" and "outdoor setting"
+- **Uses what you already know about a photo:** existing title, caption, keywords, capture date and location are given to the model as facts, so captions name the right people, places, seasons and events
+- **Keeps your keyword list tidy:** merges near-duplicates such as "outdoor", "outdoors" and "outdoor setting" into your existing keywords
 - Generated keywords are filed under an `llm` parent keyword, so they are easy to find, review or remove
 - Choose any Ollama vision model from the dialog, without editing code
 - Prompt preview and generation timer to help you tune results
@@ -67,6 +67,7 @@ Select one photo and choose **Library > Plug-in Extras > Lightroom Llama...**
 1. Optionally edit the prompt and options:
    - **Use current title and caption:** the model improves on the existing ones and keeps their names and facts
    - **Use existing keywords as context:** pre-filled with the photo's own keywords; edit the list to add hints such as a place or a person's name
+   - **Use date and location:** shows when and where the photo was taken, from its metadata; greyed out if none is recorded
    - **Use system prompt:** the full writing guidelines (recommended)
    - **Model:** any installed Ollama vision model
 2. Click **Generate**. The time taken appears in blue next to the Model box.
@@ -78,21 +79,22 @@ Tick **Preview prompt** under the photo to see exactly what will be sent to the 
 
 Select more than one photo and choose the same menu item.
 
-1. Set the prompt and options (they apply to every photo, but each photo uses its own title, caption and keywords).
+1. Set the prompt and options (they apply to every photo, but each photo uses its own title, caption, keywords, date and location). Tick **Skip photos that already have a caption** to process only new photos.
 2. Optionally enter **Keywords for this batch**, such as an event or place. These are given to the model as facts for every photo. With **Also add these keywords to every photo** ticked, they are also added to each photo as your own keywords.
 3. Click **Generate**. Each photo is captioned and saved straight away.
 
 Notes:
 - Each photo is saved as its own step, so recent ones can be reverted with Edit > Undo.
 - A blank result never wipes an existing title or caption.
-- If Ollama isn't running or the model is missing, the batch stops at the first photo.
-- A summary at the end lists any photos that failed.
+- A photo that times out or returns a broken reply is retried once.
+- If Ollama isn't running or the model is missing, the batch stops at the first photo. It also stops after 3 timeouts in a row.
+- A summary at the end shows skipped photos and lists any that failed.
 
 ### How keywords are handled
 
 - Keywords already on a photo are never repeated under `llm`.
-- Your existing `llm` keywords are offered to the model so it reuses your wording.
-- Near-duplicates are merged before saving. Matching ignores capitals, plurals (including irregular ones such as leaves/leaf and people/person) and padding words such as "setting", "scene" and "view".
+- The model is asked to cover subject, clothing and objects, setting, season and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped.
+- Near-duplicates are merged before saving, including against all your existing `llm` keywords. Matching ignores capitals, plurals (including irregular ones such as leaves/leaf and people/person) and padding words such as "setting", "scene" and "view".
 - When a generated keyword matches one you already have, your existing spelling is used.
 - Em dashes are removed from titles and captions.
 
@@ -106,8 +108,11 @@ Settings at the top of `LrLlama.lua`:
 |---|---|---|
 | `model` | `qwen3-vl:4b-instruct` | Default model shown in the dialog |
 | `thumbnailSize` | `768` | Longest side in pixels of the image sent to the model. Larger shows more detail but is slower. |
+| `requestTimeout` | `180` | Seconds to wait for Ollama to answer one photo |
+| `maxKeywords` | `15` | Most keywords kept from each reply |
+| `offerVocabularyToModel` | `false` | List your existing `llm` keywords in the prompt. Small models tend to copy unrelated keywords from it, so leave off unless using a larger model. |
 
-The model is kept loaded in Ollama for 30 minutes between requests, and uses a temperature of 0.3 for consistent results.
+Requests also keep the model loaded for 30 minutes, use a temperature of 0.3, cap replies at 600 tokens, fix the context size at 8,192 tokens and switch off "thinking".
 
 ## Troubleshooting
 
@@ -120,9 +125,13 @@ Watch it live on macOS with `tail -f ~/Library/Logs/Adobe/Lightroom/LrClassicLog
 | Message | Cause and fix |
 |---|---|
 | Could not reach Ollama | Ollama isn't running. Start it with `ollama serve` or the Ollama app. |
+| Ollama took longer than 180 seconds to answer | Ollama is running but slow or stuck. Retried once automatically; if it persists, restart Ollama. |
 | Ollama error: model '...' not found | The model isn't downloaded. Run `ollama pull <model>` or pick an installed model from `ollama list`. |
 | Ollama error: structured output is unavailable | Handled automatically: the plugin retries without JSON mode. Avoid `:cloud` and `-mlx` tags if problems continue. |
-| The model's reply wasn't valid JSON | The model ignored the format. Try another model, or check the full reply in the log. |
+| The model's reply wasn't valid JSON / was cut off | The model broke format or got stuck repeating itself. Retried once automatically; the full reply is in the log. |
+| Ollama returned an empty response / spent its whole reply thinking | The model's "thinking" used up the reply. Use a non-thinking model, such as an `-instruct` build. |
+
+**Place names missing:** the plugin reads Lightroom's location, city, state and country fields, not raw GPS. Fill those fields from the Map module first.
 
 **Performance:** Ollama's reply in the log includes timings (`prompt_eval_duration` for reading the image and prompt, `eval_duration` for writing the reply, in nanoseconds). Building standard-sized previews in Lightroom before a large batch also helps.
 
@@ -133,8 +142,9 @@ Watch it live on macOS with `tail -f ~/Library/Logs/Adobe/Lightroom/LrClassicLog
 - [x] Improve error handling and user feedback
 - [ ] Add customizable prompt templates
 - [ ] Create settings panel for model configuration
+- [x] Clean up temporary thumbnail files
 - [ ] Merge true synonyms (for example "woods" and "forest")
-- [ ] Clean up temporary thumbnail files
+- [ ] Tool to merge duplicate `llm` keywords already in the catalog
 
 ## Credits
 

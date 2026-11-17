@@ -42,4 +42,7 @@ luac.out
 # OS generated files
 .DS_Store
 
+# Claude generated files
+CLAUDE.md
+
 reference.lrplugin

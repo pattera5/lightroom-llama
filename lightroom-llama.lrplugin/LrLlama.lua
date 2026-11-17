@@ -29,49 +29,138 @@ local model = "qwen3-vl:4b-instruct" -- default; can be changed in the dialog
 -- model more detail but takes longer per photo (was 512).
 local thumbnailSize = 768
 
+-- Most keywords kept from each reply. The prompt asks for 7 to 15, but small
+-- models sometimes return more; anything past this is dropped.
+local maxKeywords = 15
+
+-- Whether to list your existing 'llm' keywords in the prompt. Off by default:
+-- small models tend to copy unrelated keywords from the list (from other
+-- photos). Near-duplicates are still matched to existing keywords in code.
+local offerVocabularyToModel = false
+
+-- Seconds to wait for Ollama to answer one photo before giving up. Lightroom's
+-- own default is much shorter than a slow photo can take, which caused
+-- "The request timed out" errors in larger batches.
+local requestTimeout = 180
+
 -- Models found not to support Ollama's JSON mode during this Lightroom session
 local noJsonModeModels = {}
+-- Models that reject the "think" setting (they have no thinking mode)
+local noThinkSettingModels = {}
 
 logger:info("Initializing Lightroom Llama Plugin")
 
 JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
 
+-- Width and height of a JPEG, read from its header (nil if not found)
+local function jpegSize(data)
+    local i, n = 3, #data
+    while i + 8 <= n do
+        if data:byte(i) ~= 0xFF then
+            i = i + 1
+        else
+            local marker = data:byte(i + 1)
+            if marker == 0xFF then
+                i = i + 1
+            elseif (marker >= 0xC0 and marker <= 0xCF) and marker ~= 0xC4 and marker ~= 0xC8 and marker ~= 0xCC then
+                local height = data:byte(i + 5) * 256 + data:byte(i + 6)
+                local width = data:byte(i + 7) * 256 + data:byte(i + 8)
+                return width, height
+            elseif marker == 0xD8 or marker == 0x01 or (marker >= 0xD0 and marker <= 0xD7) then
+                i = i + 2
+            else
+                local length = data:byte(i + 2) * 256 + data:byte(i + 3)
+                i = i + 2 + length
+            end
+        end
+    end
+    return nil
+end
+
 local function exportThumbnail(photo)
     local tempPath = LrFileUtils.chooseUniqueFileName(
         LrPathUtils.child(LrPathUtils.getStandardFilePath('temp'), "llama_thumbnail.jpg"))
 
-    -- requestJpegThumbnail is asynchronous: the callback fires later, so we must
-    -- wait for it before using the file. Keep a reference to the request so it
+    -- requestJpegThumbnail is asynchronous, and Lightroom may call back more
+    -- than once: first with a quick low-quality preview, then with a better
+    -- one. Keep the largest image received, and stop waiting once one is
+    -- (close to) the requested size. Keep a reference to the request so it
     -- isn't garbage-collected (which would cancel it).
-    local done, ok = false, false
+    local best, bestSide, failed = nil, 0, false
     local request = photo:requestJpegThumbnail(thumbnailSize, thumbnailSize, function(jpegData, errorMsg)
-        if done then return end
         if jpegData then
-            local tempFile = io.open(tempPath, "wb")
-            if tempFile then
-                tempFile:write(jpegData)
-                tempFile:close()
-                ok = true
-                logger:info("Thumbnail saved to " .. tempPath)
+            local w, h = jpegSize(jpegData)
+            local side = math.max(w or 0, h or 0)
+            if side == 0 then side = 1 end -- size unknown; still usable
+            if not best or side > bestSide then
+                best, bestSide = jpegData, side
             end
         else
+            failed = true
             logger:warn("Thumbnail request failed: " .. tostring(errorMsg))
         end
-        done = true
     end)
 
-    local waited = 0
-    while not done and waited < 15 do
+    local fullSize = thumbnailSize * 0.9
+    local waited, firstAt = 0, nil
+    while waited < 15 do
+        if best and not firstAt then firstAt = waited end
+        if best and bestSide >= fullSize then break end
+        -- Give a better version up to 5 seconds after the first one arrives
+        if firstAt and waited - firstAt >= 5 then break end
+        if failed and not best then break end
         LrTasks.sleep(0.1)
         waited = waited + 0.1
     end
     request = nil -- release the request now that we're finished with it
 
-    if ok then
-        return tempPath
+    if best then
+        local tempFile = io.open(tempPath, "wb")
+        if tempFile then
+            tempFile:write(best)
+            tempFile:close()
+            logger:info("Thumbnail saved (" .. bestSide .. " px longest side) to " .. tempPath)
+            if bestSide < fullSize then
+                logger:warn("Only a " .. bestSide .. " px thumbnail was available (wanted " .. thumbnailSize .. ")")
+            end
+            return tempPath
+        end
     end
     logger:warn("Failed to export thumbnail")
     return nil
+end
+
+-- Date and place recorded for the photo, as text for the prompt (nil if none)
+local function getPhotoFacts(photo)
+    local lines = {}
+
+    local time
+    for _, field in ipairs({ "dateTimeOriginal", "dateTime" }) do
+        local ok, value = LrTasks.pcall(function() return photo:getRawMetadata(field) end)
+        if ok and type(value) == "number" then
+            time = value
+            break
+        end
+    end
+    if time then
+        table.insert(lines, "Taken: " .. LrDate.timeToUserFormat(time, "%d %B %Y, %H:%M"))
+    end
+
+    local places = {}
+    for _, field in ipairs({ "location", "city", "stateProvince", "country" }) do
+        local ok, value = LrTasks.pcall(function() return photo:getFormattedMetadata(field) end)
+        if ok and type(value) == "string" and value:match("%S") then
+            table.insert(places, value)
+        end
+    end
+    if #places > 0 then
+        table.insert(lines, "Location: " .. table.concat(places, ", "))
+    end
+
+    if #lines == 0 then
+        return nil
+    end
+    return table.concat(lines, "\n")
 end
 
 local function base64EncodeImage(imagePath)
@@ -121,6 +210,12 @@ local function buildPrompts(prompt, currentData, useCurrentData, useSystemPrompt
             .. "instead of generic descriptions. Do NOT repeat any of these existing keywords in your keywords list; "
             .. "only return new, additional keywords.\n"
     end
+    local photoFacts = currentData.photoFacts
+    if photoFacts and not photoFacts:match("^%s*$") then
+        userPrompt = userPrompt .. "Photo details from the camera and catalog (accurate):\n" .. photoFacts .. "\n"
+            .. "Use the date for the season and time of day, and the location for place names, "
+            .. "wherever they fit what you see. Include the place name in the keywords.\n"
+    end
     if userPrompt ~= "" then
         userPrompt = userPrompt .. "\n"
     end
@@ -143,7 +238,15 @@ Caption: two to four sentences (about 40 to 80 words) that read as a natural des
 - Let the mood come from what is visible, without guessing what people think or feel.
 - Use commas and full stops. Do not use em dashes or dashes between clauses.
 
-Keywords: 7 to 15 specific keywords about the subject, setting, activity, mood and concepts in the image.
+Keywords: 7 to 15 specific keywords. Cover each of these where it applies:
+- main subject and type of photo (for example woman, portrait, landscape, close-up)
+- clothing and notable objects (for example coat, sunglasses, kayak)
+- setting and place (for example park, lake, forest, street)
+- season, weather and light (for example autumn, raining, golden hour)
+- action or pose (for example standing, paddling)
+- mood or concept (for example relaxed, confident, leisure)
+
+Keyword rules:
 - Every person, animal and notable object named in the caption must also appear as a keyword.
 - Use single words or short phrases, as singular nouns, in lower case except for names of people and places.
 - One keyword per idea. Never give variants of the same idea such as "outdoor", "outdoors" and "outdoor setting"; pick one.
@@ -193,6 +296,7 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         return nil, "Could not create a thumbnail for this photo."
     end
     local encodedImage = base64EncodeImage(thumbPath)
+    LrFileUtils.delete(thumbPath) -- temporary file no longer needed
     if not encodedImage then
         return nil, "Could not read the thumbnail file."
     end
@@ -224,9 +328,22 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         -- Keep the model in memory between requests so later Generates don't
         -- wait for it to reload (Ollama's default is 5 minutes)
         keep_alive = "30m",
+        -- Turn off step-by-step "thinking" on models that have it (Gemma 4,
+        -- Qwen thinking builds). Thinking is slow, can use up the whole reply
+        -- allowance and leave the actual answer empty.
+        think = false,
         options = {
             -- Lower temperature gives steadier, more factual metadata
-            temperature = 0.3
+            temperature = 0.3,
+            -- Most tokens the reply may use. A normal reply is about 200; this
+            -- stops a model that gets stuck repeating itself from running on
+            -- until the request times out.
+            num_predict = 600,
+            -- Discourages the model from repeating the same keywords in a loop
+            repeat_penalty = 1.1,
+            -- Room for the prompt, image and reply together. Kept fixed so
+            -- Ollama doesn't reload the model between requests.
+            num_ctx = 8192
         }
     }
 
@@ -242,7 +359,11 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
     end
 
     local response_data
-    for attempt = 1, 2 do
+    if noThinkSettingModels[useModel] then
+        postData.think = nil
+    end
+
+    for attempt = 1, 3 do
         logger:info("Sending request to " .. url .. " (model " .. useModel .. ", JSON mode " ..
             (postData.format and "on" or "off") .. ", image " .. #encodedImage .. " bytes base64)")
 
@@ -253,11 +374,17 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         local response, headers = LrHttp.post(url, jsonPayload, {{
             field = "Content-Type",
             value = "application/json"
-        }})
+        }}, "POST", requestTimeout)
 
         if not response then
-            local reason = headers and headers.error and (headers.error.name or headers.error.errorCode) or "no response"
-            return nil, "Could not reach Ollama at " .. url .. ". Is Ollama running?\n(" .. tostring(reason) .. ")"
+            local errInfo = headers and headers.error or {}
+            local reason = tostring(errInfo.name or errInfo.errorCode or "no response")
+            -- A timeout means Ollama is running but slow, which is different
+            -- from Ollama not running at all
+            if reason:lower():find("timed out", 1, true) or tostring(errInfo.errorCode) == "timedOut" then
+                return nil, "Ollama took longer than " .. requestTimeout .. " seconds to answer (request timed out).", "timeout"
+            end
+            return nil, "Could not reach Ollama at " .. url .. ". Is Ollama running?\n(" .. reason .. ")"
         end
 
         logger:info("Raw API response: " .. response)
@@ -268,7 +395,11 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         end
 
         local errText = decoded.error and tostring(decoded.error) or nil
-        if errText and postData.format and attempt == 1 and errText:lower():find("structured output", 1, true) then
+        if errText and postData.think ~= nil and errText:lower():find("think", 1, true) then
+            logger:info("Model " .. useModel .. " does not accept the think setting; retrying without it")
+            noThinkSettingModels[useModel] = true
+            postData.think = nil
+        elseif errText and postData.format and errText:lower():find("structured output", 1, true) then
             logger:info("Model " .. useModel .. " does not support JSON mode; retrying without it")
             noJsonModeModels[useModel] = true
             postData.format = nil
@@ -283,7 +414,15 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
 
     local text = response_data and response_data.response
     if type(text) ~= "string" or text:match("^%s*$") then
-        return nil, "Ollama returned an empty response for model '" .. useModel .. "'."
+        local doneReason = tostring(response_data and response_data.done_reason or "unknown")
+        local thinking = response_data and response_data.thinking
+        logger:warn("Empty response (done_reason=" .. doneReason .. ", thinking chars="
+            .. tostring(type(thinking) == "string" and #thinking or 0) .. ")")
+        if type(thinking) == "string" and thinking ~= "" then
+            return nil, "Model '" .. useModel .. "' spent its whole reply thinking and gave no answer. "
+                .. "It may not support switching thinking off; try a non-thinking model.", "badjson"
+        end
+        return nil, "Ollama returned an empty response for model '" .. useModel .. "' (stopped because: " .. doneReason .. ").", "badjson"
     end
 
     -- Remove any reasoning block and markdown code fences, then take the
@@ -304,7 +443,13 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
 
     local okInner, response_json = pcall(function() return JSON:decode(text) end)
     if not okInner or type(response_json) ~= "table" then
-        return nil, "The model's reply wasn't valid JSON:\n" .. text:sub(1, 300)
+        local doneReason = tostring(response_data.done_reason or "")
+        logger:warn("Invalid JSON from model (done_reason=" .. doneReason .. "): " .. text)
+        if doneReason == "length" then
+            return nil, "The model's reply was cut off before it finished (it hit the " .. 600
+                .. "-token limit, usually because it got stuck repeating itself).", "badjson"
+        end
+        return nil, "The model's reply wasn't valid JSON. Start of the reply:\n" .. text:sub(1, 300), "badjson"
     end
     -- Remove em dashes (and "--" used as one) from the title and caption,
     -- whatever the prompt said, replacing them with a comma
@@ -312,6 +457,16 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         if type(response_json[field]) == "string" then
             response_json[field] = removeEmDashes(response_json[field])
         end
+    end
+
+    -- Enforce the keyword maximum, keeping the model's first (most relevant) ones
+    if type(response_json.keywords) == "table" and #response_json.keywords > maxKeywords then
+        logger:info("Model returned " .. #response_json.keywords .. " keywords; keeping the first " .. maxKeywords)
+        local kept = {}
+        for i = 1, maxKeywords do
+            kept[i] = response_json.keywords[i]
+        end
+        response_json.keywords = kept
     end
 
     return response_json
@@ -566,6 +721,8 @@ local function runBatch(catalog, photos)
         props.model = model -- editable in the dialog; not saved
         props.batchKeywords = ""
         props.applyBatchKeywords = true
+        props.usePhotoFacts = true
+        props.skipCaptioned = false
 
         local f = LrView.osFactory()
         local c = f:column{
@@ -593,6 +750,16 @@ local function runBatch(catalog, photos)
             f:checkbox{
                 title = "Use each photo's existing keywords as context",
                 value = LrView.bind("useContextKeywords")
+            },
+            f:spacer{ height = 6 },
+            f:checkbox{
+                title = "Use each photo's date and location",
+                value = LrView.bind("usePhotoFacts")
+            },
+            f:spacer{ height = 6 },
+            f:checkbox{
+                title = "Skip photos that already have a caption",
+                value = LrView.bind("skipCaptioned")
             },
             f:spacer{ height = 6 },
             f:checkbox{
@@ -650,6 +817,8 @@ local function runBatch(catalog, photos)
                 useSystemPrompt = props.useSystemPrompt,
                 batchKeywords = splitKeywords(props.batchKeywords),
                 applyBatchKeywords = props.applyBatchKeywords,
+                usePhotoFacts = props.usePhotoFacts,
+                skipCaptioned = props.skipCaptioned,
                 model = props.model
             }
         end
@@ -665,10 +834,12 @@ local function runBatch(catalog, photos)
     -- The list given to the model is frozen for the whole batch so the prompt
     -- start stays identical and Ollama can reuse it. Keywords created during
     -- the batch are still matched in code via 'vocabulary'.
-    local frozenVocabularyText = vocabularyText(vocabulary)
+    local frozenVocabularyText = offerVocabularyToModel and vocabularyText(vocabulary) or nil
 
     local progress = LrProgressScope({ title = "Lightroom Llama: captioning " .. #photos .. " photos" })
     local succeeded, failures = 0, {}
+    local consecutiveTimeouts = 0
+    local skipped = 0
     local stoppedEarly
 
     for i, photo in ipairs(photos) do
@@ -680,6 +851,11 @@ local function runBatch(catalog, photos)
 
         local fileName = photo:getFormattedMetadata("fileName") or ("photo " .. i)
         progress:setCaption("Photo " .. i .. " of " .. #photos .. ": " .. fileName)
+
+        if options.skipCaptioned and (photo:getFormattedMetadata("caption") or ""):match("%S") then
+            skipped = skipped + 1
+            logger:info(fileName .. ": skipped (already has a caption)")
+        else
 
         -- Gather this photo's own metadata
         local title = photo:getFormattedMetadata("title") or ""
@@ -702,12 +878,29 @@ local function runBatch(catalog, photos)
         end
 
         local useCurrent = options.useCurrentData and (title ~= "" or caption ~= "")
-        local apiResponse, err = sendDataToApi(photo, options.prompt, {
+        local requestData = {
             title = title,
             caption = caption,
             contextKeywords = (#contextList > 0) and table.concat(contextList, ", ") or nil,
-            vocabulary = frozenVocabularyText
-        }, useCurrent, options.useSystemPrompt, options.model)
+            vocabulary = frozenVocabularyText,
+            photoFacts = options.usePhotoFacts and getPhotoFacts(photo) or nil
+        }
+        local apiResponse, err, errKind = sendDataToApi(photo, options.prompt, requestData,
+            useCurrent, options.useSystemPrompt, options.model)
+
+        -- A timed-out photo gets one more try before being counted as failed
+        if not apiResponse and (errKind == "timeout" or errKind == "badjson") and not progress:isCanceled() then
+            logger:warn(fileName .. ": " .. errKind .. ", retrying once")
+            progress:setCaption("Photo " .. i .. " of " .. #photos .. ": " .. fileName .. " (retrying)")
+            apiResponse, err, errKind = sendDataToApi(photo, options.prompt, requestData,
+                useCurrent, options.useSystemPrompt, options.model)
+        end
+
+        if errKind == "timeout" then
+            consecutiveTimeouts = consecutiveTimeouts + 1
+        else
+            consecutiveTimeouts = 0
+        end
 
         if apiResponse then
             local okWrite, writeErr = LrTasks.pcall(function()
@@ -743,12 +936,20 @@ local function runBatch(catalog, photos)
                 stoppedEarly = "Stopped early: " .. tostring(err)
                 break
             end
+            if consecutiveTimeouts >= 3 then
+                stoppedEarly = "Stopped early: Ollama timed out on 3 photos in a row. It may be stuck or short of memory; try restarting it."
+                break
+            end
         end
+        end -- not skipped
     end
 
     progress:done()
 
     local summary = succeeded .. " of " .. #photos .. " photos updated."
+    if skipped > 0 then
+        summary = summary .. " " .. skipped .. " skipped because they already had a caption."
+    end
     if stoppedEarly then
         summary = summary .. "\n\n" .. stoppedEarly
     end
@@ -784,6 +985,7 @@ local function main()
 
     local selectedPhoto = selectedPhotos[1]
     local thumbnailPath = exportThumbnail(selectedPhoto)
+    local photoFacts = getPhotoFacts(selectedPhoto)
 
     LrFunctionContext.callWithContext("showLlamaDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
@@ -801,10 +1003,11 @@ local function main()
         local userKeywordSet = getUserKeywordSet(selectedPhoto)
         -- Existing llm keywords in the catalog, offered to the model for reuse
         local vocabulary = getLlmVocabulary(catalog)
-        local frozenVocabularyText = vocabularyText(vocabulary)
+        local frozenVocabularyText = offerVocabularyToModel and vocabularyText(vocabulary) or nil
         props.useContextKeywords = props.contextKeywords ~= ""
         props.response = ""
         props.useCurrentData = props.title ~= "" or props.caption ~= ""
+        props.usePhotoFacts = photoFacts ~= nil
         props.useSystemPrompt = true
         props.model = model -- editable in the dialog; not saved
         props.elapsed = "" -- generation time, shown after each run
@@ -820,7 +1023,8 @@ local function main()
                 title = props.title,
                 caption = props.caption,
                 contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
-                vocabulary = frozenVocabularyText
+                vocabulary = frozenVocabularyText,
+                photoFacts = props.usePhotoFacts and photoFacts or nil
             }, props.useCurrentData, props.useSystemPrompt)
             props.promptPreview = "SYSTEM PROMPT" .. (props.useSystemPrompt and "" or " (minimal, \"Use system prompt\" is off)") .. ":\n"
                 .. systemPrompt
@@ -828,7 +1032,7 @@ local function main()
                 .. "\n\nALSO SENT: the photo (" .. thumbnailSize .. " px), and the required reply format (title, caption, keywords)."
         end
         for _, key in ipairs({ "showPromptPreview", "prompt", "useSystemPrompt", "useCurrentData",
-                               "title", "caption", "useContextKeywords", "contextKeywords" }) do
+                               "title", "caption", "useContextKeywords", "contextKeywords", "usePhotoFacts" }) do
             props:addObserver(key, updatePromptPreview)
         end
 
@@ -948,6 +1152,15 @@ local function main()
                     height = 10
                 },
                 f:checkbox{
+                    title = "Use date and location" .. (photoFacts and (": " .. photoFacts:gsub("\n", "; ")) or " (none recorded)"),
+                    value = LrView.bind("usePhotoFacts"),
+                    enabled = photoFacts ~= nil,
+                    width = 400
+                },
+                f:spacer{
+                    height = 10
+                },
+                f:checkbox{
                     title = "Use system prompt",
                     value = LrView.bind("useSystemPrompt")
                 },
@@ -990,12 +1203,22 @@ local function main()
 
                         LrTasks.startAsyncTask(function()
                             local startTime = LrDate.currentTime()
-                            local apiResponse, err = sendDataToApi(selectedPhoto, props.prompt, {
+                            local apiResponse, err, errKind
+                            for attempt = 1, 2 do
+                            apiResponse, err, errKind = sendDataToApi(selectedPhoto, props.prompt, {
                                 title = props.title,
                                 caption = props.caption,
                                 contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
-                                vocabulary = frozenVocabularyText
+                                vocabulary = frozenVocabularyText,
+                                photoFacts = props.usePhotoFacts and photoFacts or nil
                             }, props.useCurrentData, props.useSystemPrompt, props.model)
+                                -- One automatic retry when the reply comes back broken
+                                if apiResponse or errKind ~= "badjson" then
+                                    break
+                                end
+                                logger:warn("Invalid JSON reply, retrying once")
+                                props.status = "Retrying..."
+                            end
 
                             if not apiResponse then
                                 props.elapsed = ""
@@ -1034,6 +1257,11 @@ local function main()
             actionVerb = "Save"
         })
 
+
+        -- The preview thumbnail is no longer needed
+        if thumbnailPath then
+            LrFileUtils.delete(thumbnailPath)
+        end
 
         if result == "ok" then
             -- Save the metadata to the photo
