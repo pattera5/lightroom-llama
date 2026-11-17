@@ -255,7 +255,8 @@ Caption: two to four sentences (about 40 to 80 words) that read as a natural des
 Keywords: 7 to 15 specific keywords, not counting any names of people or places you were given. Cover each of these where it applies:
 - main subject (for example woman, dog, lighthouse)
 - type of photo, always one (for example portrait, landscape, close-up, street)
-- clothing and notable objects (for example coat, sunglasses, kayak)
+- clothing style, one keyword for the whole outfit (for example casual clothing, formal wear, sportswear)
+- notable objects (for example kayak, bicycle, umbrella)
 - setting and place (for example park, lake, forest, street)
 - season and weather (for example autumn, raining)
 - time of day and light (for example late afternoon, golden hour)
@@ -263,18 +264,19 @@ Keywords: 7 to 15 specific keywords, not counting any names of people or places 
 - mood or concept (for example relaxed, confident, leisure)
 
 Keyword rules:
-- Every person, animal and notable object named in the caption must also appear as a keyword.
+- Every main person, animal and object in the photo must also appear as a keyword. Leave out things that are small or far away in the background, even if the caption mentions them, because someone searching for them would not want this photo.
 - Use single words or short phrases, as singular nouns, in lower case except for names of people and places.
 - For a named person, also give the general word (for example woman, man, child). For a named place, give the type of place (for example park, lake, beach).
-- One keyword per idea. Never give variants of the same idea such as "outdoor", "outdoors" and "outdoor setting"; pick one.
+- One keyword per idea. Never give variants of the same idea such as "outdoor", "outdoors" and "outdoor setting"; pick one. Do not add a more detailed version of a keyword you already have, such as "autumn colours" next to "autumn" or "pine tree" next to "tree"; pick one.
 - Do not pad keywords with words like "setting", "scene", "view" or "area".
 - Never give a colour on its own (such as "orange" or "blue") because one object has that colour. When an object's colour is notable, give colour and object as one keyword (for example "orange sunglasses") instead of the object alone. A colour on its own is only for the main colour or tone of the whole image.
 - Describe things, not their properties. Do not give the material, texture, size, shape or pattern of a single object ("wooden", "leather", "small", "round", "striped"), or body parts in an ordinary photo of a person ("hand", "face", "hair"), unless they are the subject, such as a close-up of hands or wood grain.
+- Do not give single items of clothing or accessories worn by a person (such as "jeans", "top", "belt", "shoes", "watch"). Give one clothing style keyword for the whole outfit instead. A single item gets its own keyword only when the photo is about it or it stands out, such as a costume, a uniform, a wedding dress or a bright red coat.
 - No counts such as "two", "pair" or "group of three".
 - No composition words such as "background", "foreground", "horizontal", "copy space" or "bokeh" unless they are a notable feature of the photo.
 - One mood word per feeling: not "calm", "peaceful" and "tranquil" together.
 - No camera details, links or trademarks, and no generic words like "photo" or "image".
-- Final check before answering: every person, animal and notable object in your caption has a keyword (for a named person, the general word such as "woman" counts).
+- Final check before answering: every main person, animal and object in the photo has a keyword (for a named person, the general word such as "woman" counts), and nothing small or far away in the background has one.
 
 Only describe what is visible or given to you as fact. Do not guess names, places or dates.]]
     else

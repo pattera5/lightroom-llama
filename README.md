@@ -95,11 +95,13 @@ Notes:
 
 - Keywords already on a photo are never repeated under `llm`.
 - Place names from the photo's location, city, state and country fields are not added as keywords; they are used in the title and caption only.
-- The model is asked to cover main subject, type of photo (always one, such as portrait or landscape), clothing and objects, setting, season and weather, time of day and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped. Your own keywords and place names don't count towards the 7 to 15, as they are removed anyway.
+- The model is asked to cover main subject, type of photo (always one, such as portrait or landscape), clothing style (one keyword for the outfit), notable objects, setting, season and weather, time of day and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped. Your own keywords and place names don't count towards the 7 to 15, as they are removed anyway.
 - For a named person the model also gives the general word (woman, man, child), and for a named place the type of place (park, lake, beach), so the photo can be found both ways.
 - The model is asked to describe things, not their properties:
   - no colour on its own because one object has that colour; a notable colour is joined to its object ("orange sunglasses", not "orange"), and a colour on its own is only for the main colour or tone of the whole image
   - no material, texture, size, shape or pattern of a single object ("wooden", "small", "striped"), and no body parts in an ordinary photo of a person, unless they are the subject
+  - no single items of clothing or accessories ("jeans", "belt") unless the photo is about them or they stand out; one clothing style keyword ("casual clothing") instead
+  - no small or distant background details, even when the caption mentions them, and no more detailed repeat of a keyword already given ("autumn colours" next to "autumn")
   - no counts ("two", "pair"), no composition words ("background", "bokeh") unless notable, and one mood word per feeling
 
   These are prompt rules, so a small model may occasionally ignore them.
