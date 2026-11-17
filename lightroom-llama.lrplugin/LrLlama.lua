@@ -1,4 +1,3 @@
--- TODO Add keywords
 local LrHttp = import 'LrHttp'
 local LrPathUtils = import 'LrPathUtils'
 local LrLogger = import 'LrLogger'
@@ -42,6 +41,11 @@ local offerVocabularyToModel = false
 -- own default is much shorter than a slow photo can take, which caused
 -- "The request timed out" errors in larger batches.
 local requestTimeout = 180
+
+-- Most tokens a reply may use. A normal reply is about 200; this stops a
+-- model that gets stuck repeating itself from running on until the request
+-- times out.
+local maxReplyTokens = 600
 
 -- Models found not to support Ollama's JSON mode during this Lightroom session
 local noJsonModeModels = {}
@@ -185,10 +189,12 @@ end
 -- Replace em dashes with commas: "a long day — and night" -> "a long day, and night"
 local function removeEmDashes(text)
     text = text:gsub("%s*\226\128\148%s*", ", ") -- em dash (U+2014)
+    text = text:gsub("%s+\226\128\147%s+", ", ") -- spaced en dash (U+2013); "2010–2020" is left alone
     text = text:gsub("%s+%-%-%s+", ", ")       -- " -- " used as a dash
     text = text:gsub(",%s*,", ",")             -- tidy doubled commas
     text = text:gsub(",%s*([%.!%?;])", "%1")   -- no comma before end punctuation
     text = text:gsub("^,%s*", "")              -- no leading comma
+    text = text:gsub(",%s*$", "")              -- no trailing comma
     return text
 end
 
@@ -258,10 +264,8 @@ Only describe what is visible or given to you as fact. Do not guess names, place
         systemPrompt = [[Return a JSON object with a "title" (string), a "caption" (string) and "keywords" (a list of strings) describing the image. Write in English.]]
     end
 
-    -- Keyword vocabulary goes in the system prompt, straight after the fixed
-    -- instructions. Ollama skips re-reading the start of a request when it
-    -- matches the previous one, so as long as this list stays the same (it is
-    -- frozen for the whole batch) it is only read once, not for every photo.
+    -- Keyword vocabulary (only when offerVocabularyToModel is on) goes in the
+    -- system prompt, straight after the fixed instructions.
     local vocabulary = currentData.vocabulary
     if vocabulary and not vocabulary:match("^%s*$") then
         systemPrompt = systemPrompt .. "\n\nKeyword vocabulary already in use: " .. vocabulary .. "\n"
@@ -335,10 +339,7 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         options = {
             -- Lower temperature gives steadier, more factual metadata
             temperature = 0.3,
-            -- Most tokens the reply may use. A normal reply is about 200; this
-            -- stops a model that gets stuck repeating itself from running on
-            -- until the request times out.
-            num_predict = 600,
+            num_predict = maxReplyTokens,
             -- Discourages the model from repeating the same keywords in a loop
             repeat_penalty = 1.1,
             -- Room for the prompt, image and reply together. Kept fixed so
@@ -446,7 +447,7 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         local doneReason = tostring(response_data.done_reason or "")
         logger:warn("Invalid JSON from model (done_reason=" .. doneReason .. "): " .. text)
         if doneReason == "length" then
-            return nil, "The model's reply was cut off before it finished (it hit the " .. 600
+            return nil, "The model's reply was cut off before it finished (it hit the " .. maxReplyTokens
                 .. "-token limit, usually because it got stuck repeating itself).", "badjson"
         end
         return nil, "The model's reply wasn't valid JSON. Start of the reply:\n" .. text:sub(1, 300), "badjson"
@@ -457,6 +458,23 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         if type(response_json[field]) == "string" then
             response_json[field] = removeEmDashes(response_json[field])
         end
+    end
+
+    -- Split any keyword containing commas ("Oslo, Norway" -> "Oslo", "Norway"),
+    -- as Lightroom itself does, so both dialogs save the same keywords
+    if type(response_json.keywords) == "table" then
+        local split = {}
+        for _, keyword in ipairs(response_json.keywords) do
+            if type(keyword) == "string" then
+                for part in keyword:gmatch("[^,]+") do
+                    local trimmed = part:match("^%s*(.-)%s*$")
+                    if trimmed ~= "" then
+                        table.insert(split, trimmed)
+                    end
+                end
+            end
+        end
+        response_json.keywords = split
     end
 
     -- Enforce the keyword maximum, keeping the model's first (most relevant) ones
@@ -491,7 +509,16 @@ local irregularPlurals = {
     -- words ending in "ie", which the "ies" -> "y" rule would turn into "y"
     movies = "movie", cookies = "cookie", pies = "pie", ties = "tie", brownies = "brownie",
     selfies = "selfie", zombies = "zombie", rookies = "rookie", prairies = "prairie",
-    hippies = "hippie", lies = "lie"
+    hippies = "hippie", lies = "lie",
+    -- words ending in "oes" or "ses" that the rules below get wrong
+    tomatoes = "tomato", potatoes = "potato", heroes = "hero", volcanoes = "volcano",
+    buses = "bus", lenses = "lens",
+    -- words that already look plural; kept as they are so they don't merge
+    -- with a different word ("shorts" and "short", "glasses" and "glass")
+    shorts = "shorts", news = "news", jeans = "jeans", pants = "pants", clothes = "clothes",
+    trousers = "trousers", glasses = "glasses", sunglasses = "sunglasses", goggles = "goggles",
+    species = "species", series = "series", lens = "lens", canvas = "canvas",
+    christmas = "christmas", atlas = "atlas"
 }
 
 local function singularise(word)
@@ -566,7 +593,9 @@ local function addKeywordsWithParent(catalog, photo, keywords, excludeSet, vocab
                 local childKeyword = catalog:createKeyword(keyword, nil, true, llmKeyword, true)
                 -- Add the keyword object to the photo
                 photo:addKeyword(childKeyword)
-                table.insert(added, keyword)
+                -- The keyword's name as stored in the catalog (an existing
+                -- keyword may differ in capitals from the name asked for)
+                table.insert(added, childKeyword:getName())
             end
         end
     end
@@ -630,7 +659,8 @@ local function vocabularyText(vocabulary)
     return table.concat(list, ", ")
 end
 
-local function getLlmKeywordsFromPhoto(photo)
+-- The photo's keywords under the 'llm' parent, as keyword objects
+local function getLlmKeywordObjects(photo)
     local llmKeywords = {}
     local allKeywords = photo:getRawMetadata("keywords")
 
@@ -638,12 +668,20 @@ local function getLlmKeywordsFromPhoto(photo)
         for _, keyword in ipairs(allKeywords) do
             local parent = keyword:getParent()
             if parent and parent:getName() == "llm" then
-                table.insert(llmKeywords, keyword:getName())
+                table.insert(llmKeywords, keyword)
             end
         end
     end
 
     return llmKeywords
+end
+
+local function getLlmKeywordsFromPhoto(photo)
+    local names = {}
+    for _, keyword in ipairs(getLlmKeywordObjects(photo)) do
+        table.insert(names, keyword:getName())
+    end
+    return names
 end
 
 -- Keywords you assigned yourself (everything not under the 'llm' parent)
@@ -831,9 +869,9 @@ local function runBatch(catalog, photos)
     -- Existing llm keywords, reused across the batch. Keywords added for one
     -- photo are added to it, so similar photos share the same keywords.
     local vocabulary = getLlmVocabulary(catalog)
-    -- The list given to the model is frozen for the whole batch so the prompt
-    -- start stays identical and Ollama can reuse it. Keywords created during
-    -- the batch are still matched in code via 'vocabulary'.
+    -- The list given to the model (only when offerVocabularyToModel is on) is
+    -- frozen for the whole batch. Keywords created during the batch are still
+    -- matched in code via 'vocabulary'.
     local frozenVocabularyText = offerVocabularyToModel and vocabularyText(vocabulary) or nil
 
     local progress = LrProgressScope({ title = "Lightroom Llama: captioning " .. #photos .. " photos" })
@@ -842,20 +880,14 @@ local function runBatch(catalog, photos)
     local skipped = 0
     local stoppedEarly
 
-    for i, photo in ipairs(photos) do
-        if progress:isCanceled() then
-            stoppedEarly = "Cancelled."
-            break
-        end
-        progress:setPortionComplete(i - 1, #photos)
-
-        local fileName = photo:getFormattedMetadata("fileName") or ("photo " .. i)
-        progress:setCaption("Photo " .. i .. " of " .. #photos .. ": " .. fileName)
-
+    -- Captions one photo. Returns a message when the whole batch should stop,
+    -- otherwise nil.
+    local function processPhoto(i, photo, fileName)
         if options.skipCaptioned and (photo:getFormattedMetadata("caption") or ""):match("%S") then
             skipped = skipped + 1
             logger:info(fileName .. ": skipped (already has a caption)")
-        else
+            return nil
+        end
 
         -- Gather this photo's own metadata
         local title = photo:getFormattedMetadata("title") or ""
@@ -933,15 +965,42 @@ local function runBatch(catalog, photos)
             logger:error(fileName .. ": " .. tostring(err))
             table.insert(failures, fileName .. ": " .. tostring(err))
             if isFatalError(err) then
-                stoppedEarly = "Stopped early: " .. tostring(err)
-                break
+                return "Stopped early: " .. tostring(err)
             end
             if consecutiveTimeouts >= 3 then
-                stoppedEarly = "Stopped early: Ollama timed out on 3 photos in a row. It may be stuck or short of memory; try restarting it."
-                break
+                return "Stopped early: Ollama timed out on 3 photos in a row. It may be stuck or short of memory; try restarting it."
             end
         end
-        end -- not skipped
+        return nil
+    end
+
+    for i, photo in ipairs(photos) do
+        if progress:isCanceled() then
+            stoppedEarly = "Cancelled."
+            break
+        end
+        progress:setPortionComplete(i - 1, #photos)
+
+        local fileName = "photo " .. i
+        local okName, name = LrTasks.pcall(function() return photo:getFormattedMetadata("fileName") end)
+        if okName and type(name) == "string" and name ~= "" then
+            fileName = name
+        end
+        progress:setCaption("Photo " .. i .. " of " .. #photos .. ": " .. fileName)
+
+        -- An unexpected error on one photo is recorded as a failure and the
+        -- batch moves on to the next photo, instead of stopping with
+        -- Lightroom's raw error and leaving the progress bar on screen
+        local ok, stopReason = LrTasks.pcall(function()
+            return processPhoto(i, photo, fileName)
+        end)
+        if not ok then
+            logger:error(fileName .. ": unexpected error: " .. tostring(stopReason))
+            table.insert(failures, fileName .. ": unexpected error (" .. tostring(stopReason) .. ")")
+        elseif stopReason then
+            stoppedEarly = stopReason
+            break
+        end
     end
 
     progress:done()
@@ -1011,6 +1070,7 @@ local function main()
         props.useSystemPrompt = true
         props.model = model -- editable in the dialog; not saved
         props.elapsed = "" -- generation time, shown after each run
+        props.canGenerate = true -- false while a request is running
 
         -- "Preview prompt": read-only view of exactly what will be sent
         props.showPromptPreview = false
@@ -1196,22 +1256,32 @@ local function main()
                 },
                 f:row{f:push_button{
                     title = "Generate",
+                    enabled = LrView.bind("canGenerate"), -- off while a request is running
                     action = function()
+                        props.canGenerate = false
                         props.status = "The llama is thinking..."
                         props.statusColor = LrColor(0.439, 0.345, 0.745)
                         props.elapsed = ""
 
-                        LrTasks.startAsyncTask(function()
+                        local function showError(message)
+                            props.elapsed = ""
+                            logger:error(message)
+                            props.status = "Error"
+                            props.statusColor = LrColor(0.8, 0.2, 0.2)
+                            LrDialogs.message("Lightroom Llama", message or "Unknown error", "critical")
+                        end
+
+                        local function generate()
                             local startTime = LrDate.currentTime()
                             local apiResponse, err, errKind
                             for attempt = 1, 2 do
-                            apiResponse, err, errKind = sendDataToApi(selectedPhoto, props.prompt, {
-                                title = props.title,
-                                caption = props.caption,
-                                contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
-                                vocabulary = frozenVocabularyText,
-                                photoFacts = props.usePhotoFacts and photoFacts or nil
-                            }, props.useCurrentData, props.useSystemPrompt, props.model)
+                                apiResponse, err, errKind = sendDataToApi(selectedPhoto, props.prompt, {
+                                    title = props.title,
+                                    caption = props.caption,
+                                    contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
+                                    vocabulary = frozenVocabularyText,
+                                    photoFacts = props.usePhotoFacts and photoFacts or nil
+                                }, props.useCurrentData, props.useSystemPrompt, props.model)
                                 -- One automatic retry when the reply comes back broken
                                 if apiResponse or errKind ~= "badjson" then
                                     break
@@ -1221,16 +1291,17 @@ local function main()
                             end
 
                             if not apiResponse then
-                                props.elapsed = ""
-                                logger:error(err)
-                                props.status = "Error"
-                                props.statusColor = LrColor(0.8, 0.2, 0.2)
-                                LrDialogs.message("Lightroom Llama", err or "Unknown error", "critical")
+                                showError(err)
                                 return
                             end
 
-                            props.title = apiResponse.title or props.title
-                            props.caption = apiResponse.caption or props.caption
+                            -- A blank title or caption never replaces the current one
+                            if type(apiResponse.title) == "string" and apiResponse.title:match("%S") then
+                                props.title = apiResponse.title
+                            end
+                            if type(apiResponse.caption) == "string" and apiResponse.caption:match("%S") then
+                                props.caption = apiResponse.caption
+                            end
                             -- Convert keywords array to comma-separated string for display
                             if apiResponse.keywords and type(apiResponse.keywords) == "table" then
                                 props.keywords = table.concat(filterKeywords(apiResponse.keywords, userKeywordSet, vocabulary), ", ")
@@ -1240,6 +1311,15 @@ local function main()
                             props.elapsed = string.format("%d s", math.floor(LrDate.currentTime() - startTime + 0.5))
                             props.status = "Ready"
                             props.statusColor = LrColor(0.149, 0.616, 0.412)
+                        end
+
+                        LrTasks.startAsyncTask(function()
+                            local ok, problem = LrTasks.pcall(generate)
+                            if not ok then
+                                showError("Something went wrong: " .. tostring(problem))
+                            end
+                            -- Always turn the button back on, even after an error
+                            props.canGenerate = true
                         end)
                     end
                 }},
@@ -1254,7 +1334,15 @@ local function main()
         local result = LrDialogs.presentModalDialog({
             title = "Lightroom Llama",
             contents = c,
-            actionVerb = "Save"
+            actionVerb = "Save",
+            -- Save is greyed out while Generate is running, so it can't save
+            -- the old text while a new reply is on its way
+            actionBinding = {
+                enabled = {
+                    bind_to_object = props,
+                    key = "canGenerate"
+                }
+            }
         })
 
 
@@ -1264,21 +1352,50 @@ local function main()
         end
 
         if result == "ok" then
+            -- The photo's current 'llm' keywords, read before saving so any
+            -- no longer in the Keywords box can be removed from the photo
+            local oldLlmKeywords = getLlmKeywordObjects(selectedPhoto)
+            local removedCount = 0
+
             -- Save the metadata to the photo
-            catalog:withWriteAccessDo("Save Llama metadata", function()
-                selectedPhoto:setRawMetadata("title", props.title)
-                selectedPhoto:setRawMetadata("caption", props.caption)
-                -- Parse keywords from comma-separated string and add with llm parent
-                if props.keywords and props.keywords ~= "" then
-                    local keywordList = {}
-                    for keyword in string.gmatch(props.keywords, "([^,]+)") do
-                        table.insert(keywordList, keyword:match("^%s*(.-)%s*$")) -- trim whitespace
+            local okWrite, writeErr = LrTasks.pcall(function()
+                catalog:withWriteAccessDo("Save Llama metadata", function()
+                    selectedPhoto:setRawMetadata("title", props.title or "")
+                    selectedPhoto:setRawMetadata("caption", props.caption or "")
+                    -- Add the keywords in the box under the llm parent
+                    local added = addKeywordsWithParent(catalog, selectedPhoto,
+                        splitKeywords(props.keywords), userKeywordSet, vocabulary)
+                    -- Remove llm keywords that are no longer in the box, so the
+                    -- photo ends up with exactly the keywords shown. Matching
+                    -- is by exact name, so duplicate variants already on the
+                    -- photo ("tree" and "trees") are cut down to the one kept.
+                    -- Removed keywords stay in the catalog (Metadata > Purge
+                    -- Unused Keywords clears them).
+                    local keep = {}
+                    for _, name in ipairs(added) do
+                        keep[name] = true
                     end
-                    addKeywordsWithParent(catalog, selectedPhoto, keywordList, userKeywordSet, vocabulary)
-                end
+                    for _, keyword in ipairs(oldLlmKeywords) do
+                        if not keep[keyword:getName()] then
+                            selectedPhoto:removeKeyword(keyword)
+                            removedCount = removedCount + 1
+                        end
+                    end
+                end, { timeout = 30 })
             end)
 
-            LrDialogs.message("Metadata Saved", "Title, caption, and keywords have been saved to the photo.", "info")
+            if okWrite then
+                local message = "Title, caption, and keywords have been saved to the photo."
+                if removedCount > 0 then
+                    message = message .. " " .. removedCount .. " llm keyword(s) no longer in the Keywords box were removed from it."
+                end
+                LrDialogs.message("Metadata Saved", message, "info")
+            else
+                logger:error("Could not save metadata: " .. tostring(writeErr))
+                LrDialogs.message("Lightroom Llama",
+                    "Could not save to the photo. Lightroom may be busy; please try again.\n(" .. tostring(writeErr) .. ")",
+                    "critical")
+            end
         end
     end)
 end

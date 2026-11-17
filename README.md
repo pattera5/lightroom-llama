@@ -70,8 +70,8 @@ Select one photo and choose **Library > Plug-in Extras > Lightroom Llama...**
    - **Use date and location:** shows when and where the photo was taken, from its metadata; greyed out if none is recorded
    - **Use system prompt:** the full writing guidelines (recommended)
    - **Model:** any installed Ollama vision model
-2. Click **Generate**. The time taken appears in blue next to the Model box.
-3. Review and edit the title, caption and keywords, then click **Save**.
+2. Click **Generate**. The button is greyed out until the reply arrives, then the time taken appears in blue next to the Model box. A blank title or caption in the reply leaves the current one in place.
+3. Review and edit the title, caption and keywords, then click **Save**. The photo's `llm` keywords are set to exactly what is in the Keywords box: any you removed from the box are removed from the photo, and duplicate variants already on it (such as "tree" and "trees") are cut down to one. Save is greyed out while Generate is running.
 
 Tick **Preview prompt** under the photo to see exactly what will be sent to the model.
 
@@ -87,6 +87,7 @@ Notes:
 - Each photo is saved as its own step, so recent ones can be reverted with Edit > Undo.
 - A blank result never wipes an existing title or caption.
 - A photo that times out or returns a broken reply is retried once.
+- A photo that hits an unexpected error is listed as failed and the batch moves on to the next one.
 - If Ollama isn't running or the model is missing, the batch stops at the first photo. It also stops after 3 timeouts in a row.
 - A summary at the end shows skipped photos and lists any that failed.
 
@@ -96,7 +97,9 @@ Notes:
 - The model is asked to cover subject, clothing and objects, setting, season and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped.
 - Near-duplicates are merged before saving, including against all your existing `llm` keywords. Matching ignores capitals, plurals (including irregular ones such as leaves/leaf and people/person) and padding words such as "setting", "scene" and "view".
 - When a generated keyword matches one you already have, your existing spelling is used.
-- Em dashes are removed from titles and captions.
+- Words such as shorts, glasses, jeans and news are treated as their own words, not plurals.
+- A keyword containing commas, such as "Oslo, Norway", is split into separate keywords.
+- Em dashes (and dashes used between clauses) are removed from titles and captions.
 
 To clean up old duplicate keywords, remove them from your photos and choose **Metadata > Purge Unused Keywords**.
 
@@ -110,9 +113,10 @@ Settings at the top of `LrLlama.lua`:
 | `thumbnailSize` | `768` | Longest side in pixels of the image sent to the model. Larger shows more detail but is slower. |
 | `requestTimeout` | `180` | Seconds to wait for Ollama to answer one photo |
 | `maxKeywords` | `15` | Most keywords kept from each reply |
+| `maxReplyTokens` | `600` | Most tokens a reply may use, so a model stuck repeating itself stops quickly |
 | `offerVocabularyToModel` | `false` | List your existing `llm` keywords in the prompt. Small models tend to copy unrelated keywords from it, so leave off unless using a larger model. |
 
-Requests also keep the model loaded for 30 minutes, use a temperature of 0.3, cap replies at 600 tokens, fix the context size at 8,192 tokens and switch off "thinking".
+Requests also keep the model loaded for 30 minutes, use a temperature of 0.3, fix the context size at 8,192 tokens and switch off "thinking".
 
 ## Troubleshooting
 
@@ -130,6 +134,7 @@ Watch it live on macOS with `tail -f ~/Library/Logs/Adobe/Lightroom/LrClassicLog
 | Ollama error: structured output is unavailable | Handled automatically: the plugin retries without JSON mode. Avoid `:cloud` and `-mlx` tags if problems continue. |
 | The model's reply wasn't valid JSON / was cut off | The model broke format or got stuck repeating itself. Retried once automatically; the full reply is in the log. |
 | Ollama returned an empty response / spent its whole reply thinking | The model's "thinking" used up the reply. Use a non-thinking model, such as an `-instruct` build. |
+| Could not save to the photo | Lightroom was busy (for example another plugin or a sync was writing to the catalog). Click Save again in a moment. |
 
 **Place names missing:** the plugin reads Lightroom's location, city, state and country fields, not raw GPS. Fill those fields from the Map module first.
 
@@ -145,6 +150,8 @@ Watch it live on macOS with `tail -f ~/Library/Logs/Adobe/Lightroom/LrClassicLog
 - [x] Clean up temporary thumbnail files
 - [ ] Merge true synonyms (for example "woods" and "forest")
 - [ ] Tool to merge duplicate `llm` keywords already in the catalog
+- [ ] Put processed batch photos in a review collection
+- [ ] Decide whether single-photo Save should keep an `llm` keyword that has the same name as one of your own keywords on the photo (at the moment the `llm` copy is removed)
 
 ## Credits
 
