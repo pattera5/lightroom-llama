@@ -67,7 +67,7 @@ Select one photo and choose **Library > Plug-in Extras > Lightroom Llama...**
 1. Optionally edit the prompt and options:
    - **Use current title and caption:** the model improves on the existing ones and keeps their names and facts
    - **Use existing keywords as context:** pre-filled with the photo's own keywords; edit the list to add hints such as a place or a person's name
-   - **Use date and location:** shows when and where the photo was taken, from its metadata; greyed out if none is recorded
+   - **Use date and location:** shows when and where the photo was taken, from its metadata; greyed out if none is recorded. These are background for the title and caption: place names such as the city or state are not added as keywords (generic words such as "park" still are).
    - **Use system prompt:** the full writing guidelines (recommended)
    - **Model:** any installed Ollama vision model
 2. Click **Generate**. The button is greyed out until the reply arrives, then the time taken appears in blue next to the Model box. A blank title or caption in the reply leaves the current one in place.
@@ -94,7 +94,15 @@ Notes:
 ### How keywords are handled
 
 - Keywords already on a photo are never repeated under `llm`.
-- The model is asked to cover subject, clothing and objects, setting, season and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped.
+- Place names from the photo's location, city, state and country fields are not added as keywords; they are used in the title and caption only.
+- The model is asked to cover main subject, type of photo (always one, such as portrait or landscape), clothing and objects, setting, season and weather, time of day and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped. Your own keywords and place names don't count towards the 7 to 15, as they are removed anyway.
+- For a named person the model also gives the general word (woman, man, child), and for a named place the type of place (park, lake, beach), so the photo can be found both ways.
+- The model is asked to describe things, not their properties:
+  - no colour on its own because one object has that colour; a notable colour is joined to its object ("orange sunglasses", not "orange"), and a colour on its own is only for the main colour or tone of the whole image
+  - no material, texture, size, shape or pattern of a single object ("wooden", "small", "striped"), and no body parts in an ordinary photo of a person, unless they are the subject
+  - no counts ("two", "pair"), no composition words ("background", "bokeh") unless notable, and one mood word per feeling
+
+  These are prompt rules, so a small model may occasionally ignore them.
 - Near-duplicates are merged before saving, including against all your existing `llm` keywords. Matching ignores capitals, plurals (including irregular ones such as leaves/leaf and people/person) and padding words such as "setting", "scene" and "view".
 - When a generated keyword matches one you already have, your existing spelling is used.
 - Words such as shorts, glasses, jeans and news are treated as their own words, not plurals.

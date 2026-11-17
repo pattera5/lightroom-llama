@@ -47,6 +47,10 @@ local requestTimeout = 180
 -- times out.
 local maxReplyTokens = 600
 
+-- Keyword matching function, defined further down with the other keyword
+-- helpers but used earlier (in sendDataToApi)
+local normaliseKeyword
+
 -- Models found not to support Ollama's JSON mode during this Lightroom session
 local noJsonModeModels = {}
 -- Models that reject the "think" setting (they have no thinking mode)
@@ -134,7 +138,8 @@ local function exportThumbnail(photo)
     return nil
 end
 
--- Date and place recorded for the photo, as text for the prompt (nil if none)
+-- Date and place recorded for the photo, as text for the prompt (nil if
+-- none), plus the list of place names (used to keep them out of keywords)
 local function getPhotoFacts(photo)
     local lines = {}
 
@@ -162,9 +167,9 @@ local function getPhotoFacts(photo)
     end
 
     if #lines == 0 then
-        return nil
+        return nil, places
     end
-    return table.concat(lines, "\n")
+    return table.concat(lines, "\n"), places
 end
 
 local function base64EncodeImage(imagePath)
@@ -214,13 +219,16 @@ local function buildPrompts(prompt, currentData, useCurrentData, useSystemPrompt
             .. contextKeywords .. "\n"
             .. "Treat these keywords as accurate. Use them to name the specific people, places and subjects in the title and caption "
             .. "instead of generic descriptions. Do NOT repeat any of these existing keywords in your keywords list; "
-            .. "only return new, additional keywords.\n"
+            .. "only return new, additional keywords. They are already saved and do not count towards the 7 to 15 keywords. "
+            .. "Still give the general word for each person named here (for example woman, man, child).\n"
     end
     local photoFacts = currentData.photoFacts
     if photoFacts and not photoFacts:match("^%s*$") then
         userPrompt = userPrompt .. "Photo details from the camera and catalog (accurate):\n" .. photoFacts .. "\n"
-            .. "Use the date for the season and time of day, and the location for place names, "
-            .. "wherever they fit what you see. Include the place name in the keywords.\n"
+            .. "These are background information. Use the date for the season and time of day, and the location "
+            .. "for place names in the title and caption, wherever they fit what you see. "
+            .. "Do not use these place names as keywords, but do give the type of place (for example park, lake, beach). "
+            .. "The place names do not count towards the 7 to 15 keywords.\n"
     end
     if userPrompt ~= "" then
         userPrompt = userPrompt .. "\n"
@@ -244,20 +252,29 @@ Caption: two to four sentences (about 40 to 80 words) that read as a natural des
 - Let the mood come from what is visible, without guessing what people think or feel.
 - Use commas and full stops. Do not use em dashes or dashes between clauses.
 
-Keywords: 7 to 15 specific keywords. Cover each of these where it applies:
-- main subject and type of photo (for example woman, portrait, landscape, close-up)
+Keywords: 7 to 15 specific keywords, not counting any names of people or places you were given. Cover each of these where it applies:
+- main subject (for example woman, dog, lighthouse)
+- type of photo, always one (for example portrait, landscape, close-up, street)
 - clothing and notable objects (for example coat, sunglasses, kayak)
 - setting and place (for example park, lake, forest, street)
-- season, weather and light (for example autumn, raining, golden hour)
+- season and weather (for example autumn, raining)
+- time of day and light (for example late afternoon, golden hour)
 - action or pose (for example standing, paddling)
 - mood or concept (for example relaxed, confident, leisure)
 
 Keyword rules:
 - Every person, animal and notable object named in the caption must also appear as a keyword.
 - Use single words or short phrases, as singular nouns, in lower case except for names of people and places.
+- For a named person, also give the general word (for example woman, man, child). For a named place, give the type of place (for example park, lake, beach).
 - One keyword per idea. Never give variants of the same idea such as "outdoor", "outdoors" and "outdoor setting"; pick one.
 - Do not pad keywords with words like "setting", "scene", "view" or "area".
+- Never give a colour on its own (such as "orange" or "blue") because one object has that colour. When an object's colour is notable, give colour and object as one keyword (for example "orange sunglasses") instead of the object alone. A colour on its own is only for the main colour or tone of the whole image.
+- Describe things, not their properties. Do not give the material, texture, size, shape or pattern of a single object ("wooden", "leather", "small", "round", "striped"), or body parts in an ordinary photo of a person ("hand", "face", "hair"), unless they are the subject, such as a close-up of hands or wood grain.
+- No counts such as "two", "pair" or "group of three".
+- No composition words such as "background", "foreground", "horizontal", "copy space" or "bokeh" unless they are a notable feature of the photo.
+- One mood word per feeling: not "calm", "peaceful" and "tranquil" together.
 - No camera details, links or trademarks, and no generic words like "photo" or "image".
+- Final check before answering: every person, animal and notable object in your caption has a keyword (for a named person, the general word such as "woman" counts).
 
 Only describe what is visible or given to you as fact. Do not guess names, places or dates.]]
     else
@@ -477,12 +494,23 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         response_json.keywords = split
     end
 
-    -- Enforce the keyword maximum, keeping the model's first (most relevant) ones
-    if type(response_json.keywords) == "table" and #response_json.keywords > maxKeywords then
-        logger:info("Model returned " .. #response_json.keywords .. " keywords; keeping the first " .. maxKeywords)
-        local kept = {}
-        for i = 1, maxKeywords do
-            kept[i] = response_json.keywords[i]
+    -- Enforce the keyword maximum, keeping the model's first (most relevant)
+    -- ones. Keywords the plugin drops later anyway (your own keywords and the
+    -- photo's place names, in currentData.excludeKeys) don't count towards it.
+    if type(response_json.keywords) == "table" then
+        local excludeKeys = currentData.excludeKeys or {}
+        local kept, counted = {}, 0
+        for _, keyword in ipairs(response_json.keywords) do
+            if excludeKeys[normaliseKeyword(keyword)] then
+                table.insert(kept, keyword)
+            elseif counted < maxKeywords then
+                counted = counted + 1
+                table.insert(kept, keyword)
+            end
+        end
+        if #kept < #response_json.keywords then
+            logger:info("Model returned " .. #response_json.keywords .. " keywords; keeping the first " .. maxKeywords
+                .. " (not counting your own keywords and place names)")
         end
         response_json.keywords = kept
     end
@@ -536,7 +564,7 @@ end
 -- Simplified form of a keyword used for matching: lower-case, singular, with
 -- filler words removed. "Outdoors", "outdoor" and "outdoor setting" all
 -- become "outdoor", so they are treated as the same keyword.
-local function normaliseKeyword(keyword)
+function normaliseKeyword(keyword) -- assigns the local declared at the top
     if type(keyword) ~= "string" then return "" end
     local text = keyword:lower():gsub("[%-_/]", " ")
     local words, kept = {}, {}
@@ -551,6 +579,15 @@ local function normaliseKeyword(keyword)
         kept = words -- the keyword was only filler words; keep it as is
     end
     return table.concat(kept, " ")
+end
+
+-- Adds place names to a keyword exclusion set, so the photo's location is
+-- used as background for the title and caption but not returned as keywords
+local function excludePlaces(set, places)
+    for _, place in ipairs(places or {}) do
+        set[normaliseKeyword(place)] = true
+    end
+    return set
 end
 
 -- Clean up a list of generated keywords:
@@ -593,9 +630,10 @@ local function addKeywordsWithParent(catalog, photo, keywords, excludeSet, vocab
                 local childKeyword = catalog:createKeyword(keyword, nil, true, llmKeyword, true)
                 -- Add the keyword object to the photo
                 photo:addKeyword(childKeyword)
-                -- The keyword's name as stored in the catalog (an existing
-                -- keyword may differ in capitals from the name asked for)
-                table.insert(added, childKeyword:getName())
+                -- Don't call childKeyword:getName() here: a keyword created in
+                -- this same catalog write isn't usable until the write ends,
+                -- and asking for its name fails ("attempt to index a nil value")
+                table.insert(added, keyword)
             end
         end
     end
@@ -909,13 +947,21 @@ local function runBatch(catalog, photos)
             end
         end
 
+        -- Date and location, given as background; place names never become keywords
+        local photoFacts, photoPlaces
+        if options.usePhotoFacts then
+            photoFacts, photoPlaces = getPhotoFacts(photo)
+            excludePlaces(excludeSet, photoPlaces)
+        end
+
         local useCurrent = options.useCurrentData and (title ~= "" or caption ~= "")
         local requestData = {
             title = title,
             caption = caption,
             contextKeywords = (#contextList > 0) and table.concat(contextList, ", ") or nil,
             vocabulary = frozenVocabularyText,
-            photoFacts = options.usePhotoFacts and getPhotoFacts(photo) or nil
+            photoFacts = photoFacts,
+            excludeKeys = excludeSet
         }
         local apiResponse, err, errKind = sendDataToApi(photo, options.prompt, requestData,
             useCurrent, options.useSystemPrompt, options.model)
@@ -1044,7 +1090,7 @@ local function main()
 
     local selectedPhoto = selectedPhotos[1]
     local thumbnailPath = exportThumbnail(selectedPhoto)
-    local photoFacts = getPhotoFacts(selectedPhoto)
+    local photoFacts, photoPlaces = getPhotoFacts(selectedPhoto)
 
     LrFunctionContext.callWithContext("showLlamaDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
@@ -1273,6 +1319,16 @@ local function main()
 
                         local function generate()
                             local startTime = LrDate.currentTime()
+                            -- Keywords never added under llm: your own keywords and, as
+                            -- they are background only, the photo's place names (you can
+                            -- still type a place name into the box yourself)
+                            local excludeSet = {}
+                            for key in pairs(userKeywordSet) do
+                                excludeSet[key] = true
+                            end
+                            if props.usePhotoFacts then
+                                excludePlaces(excludeSet, photoPlaces)
+                            end
                             local apiResponse, err, errKind
                             for attempt = 1, 2 do
                                 apiResponse, err, errKind = sendDataToApi(selectedPhoto, props.prompt, {
@@ -1280,7 +1336,8 @@ local function main()
                                     caption = props.caption,
                                     contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
                                     vocabulary = frozenVocabularyText,
-                                    photoFacts = props.usePhotoFacts and photoFacts or nil
+                                    photoFacts = props.usePhotoFacts and photoFacts or nil,
+                                    excludeKeys = excludeSet
                                 }, props.useCurrentData, props.useSystemPrompt, props.model)
                                 -- One automatic retry when the reply comes back broken
                                 if apiResponse or errKind ~= "badjson" then
@@ -1304,7 +1361,7 @@ local function main()
                             end
                             -- Convert keywords array to comma-separated string for display
                             if apiResponse.keywords and type(apiResponse.keywords) == "table" then
-                                props.keywords = table.concat(filterKeywords(apiResponse.keywords, userKeywordSet, vocabulary), ", ")
+                                props.keywords = table.concat(filterKeywords(apiResponse.keywords, excludeSet, vocabulary), ", ")
                             else
                                 props.keywords = ""
                             end
@@ -1367,16 +1424,16 @@ local function main()
                         splitKeywords(props.keywords), userKeywordSet, vocabulary)
                     -- Remove llm keywords that are no longer in the box, so the
                     -- photo ends up with exactly the keywords shown. Matching
-                    -- is by exact name, so duplicate variants already on the
-                    -- photo ("tree" and "trees") are cut down to the one kept.
-                    -- Removed keywords stay in the catalog (Metadata > Purge
-                    -- Unused Keywords clears them).
+                    -- is by name, ignoring capitals only, so duplicate
+                    -- variants already on the photo ("tree" and "trees") are
+                    -- cut down to the one kept. Removed keywords stay in the
+                    -- catalog (Metadata > Purge Unused Keywords clears them).
                     local keep = {}
                     for _, name in ipairs(added) do
-                        keep[name] = true
+                        keep[name:lower()] = true
                     end
                     for _, keyword in ipairs(oldLlmKeywords) do
-                        if not keep[keyword:getName()] then
+                        if not keep[keyword:getName():lower()] then
                             selectedPhoto:removeKeyword(keyword)
                             removedCount = removedCount + 1
                         end

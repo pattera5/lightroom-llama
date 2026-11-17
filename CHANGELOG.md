@@ -46,9 +46,16 @@ First release of this fork, compared with the original plugin. Most changes are 
   - Single mode: a checkbox and editable box, pre-filled with the photo's own (non-`llm`) keywords.
   - Batch mode: an option to use each photo's own keywords.
   - The model treats them as verified facts and does not repeat them.
-- **Date and location as context.** When the photo was taken, and its location, city, state and country fields, are given to the model as accurate facts for season, time of day and place names. A checkbox in each dialog, on by default when the photo has them.
-- **Keyword categories.** The model is asked to cover, where they apply: main subject and type of photo; clothing and notable objects; setting and place; season, weather and light; action or pose; mood or concept.
-- **Keyword rules** (under their own heading): 7 to 15 keywords, everything named in the caption also a keyword, singular nouns, lower case except names, one keyword per idea, no padding words such as "setting", "scene", "view" or "area", no camera details or generic words.
+- **Date and location as context.** When the photo was taken, and its location, city, state and country fields, are given to the model as accurate background facts for season, time of day and place names in the title and caption. A checkbox in each dialog, on by default when the photo has them.
+- **Place names kept out of keywords.** The photo's location, city, state and country are background only: the prompt asks the model not to use them as keywords, and any keyword matching one of them is dropped in code. Generic place words such as "park" or "lake" are still given. In single-photo mode you can still type a place name into the Keywords box yourself.
+- **Keyword categories.** The model is asked to cover, where they apply: main subject; type of photo (always one, so a portrait gets both "woman" and "portrait"); clothing and notable objects; setting and place; season and weather; time of day and light; action or pose; mood or concept.
+- **Keyword rules** (under their own heading): 7 to 15 keywords, not counting names of people or places the model was given; everything named in the caption also a keyword, repeated as a final check at the end; for a named person also the general word (woman, man, child) and for a named place the type of place (park, lake, beach) instead of its name; singular nouns, lower case except names, one keyword per idea, no padding words such as "setting", "scene", "view" or "area", no camera details or generic words.
+- **What not to give as keywords:**
+  - a colour on its own because one object has that colour; a notable colour is joined to its object ("orange sunglasses"), and a lone colour is only for the main colour or tone of the whole image
+  - the material, texture, size, shape or pattern of a single object ("wooden", "small", "striped"), or body parts in an ordinary photo of a person, unless they are the subject
+  - counts such as "two" or "pair"
+  - composition words such as "background" or "bokeh", unless notable
+  - several mood words for one feeling ("calm", "peaceful", "tranquil")
 - **Existing-keyword list removed from the prompt.** An earlier version listed up to 200 existing `llm` keywords for the model to reuse. The small model copied unrelated keywords from it (from other photos), so it is off by default (`offerVocabularyToModel = false`). Near-duplicate matching in code still uses all existing keywords.
 
 ### Keyword clean-up in code
@@ -59,7 +66,7 @@ First release of this fork, compared with the original plugin. Most changes are 
 - **Keywords containing commas split.** A reply keyword such as "Oslo, Norway" becomes "Oslo" and "Norway", as Lightroom does, so single and batch mode save the same keywords.
 - **Existing spelling reused.** When a generated keyword matches an existing `llm` keyword, the existing one is used rather than a new variant being created.
 - **Plainer variant kept.** When a reply contains two new variants of one idea, the shorter is kept ("forest" over "forest scene").
-- **Keyword cap enforced.** Only the first 15 keywords of a reply are kept (`maxKeywords`).
+- **Keyword cap enforced.** Only the first 15 keywords of a reply are kept (`maxKeywords`). Your own keywords and the photo's place names, which are removed anyway, don't count towards the 15.
 
 ### Single-photo dialog
 
