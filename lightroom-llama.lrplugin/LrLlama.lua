@@ -2,7 +2,6 @@ local LrHttp = import 'LrHttp'
 local LrPathUtils = import 'LrPathUtils'
 local LrLogger = import 'LrLogger'
 local LrApplication = import "LrApplication"
-local LrErrors = import "LrErrors"
 local LrDialogs = import "LrDialogs"
 local LrView = import "LrView"
 local LrTasks = import "LrTasks"
@@ -58,7 +57,29 @@ local noThinkSettingModels = {}
 
 logger:info("Initializing Lightroom Llama Plugin")
 
-JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
+local JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
+
+-- Status colours in the single-photo dialog
+local colourReady = LrColor(0.149, 0.616, 0.412)
+local colourBusy = LrColor(0.439, 0.345, 0.745)
+local colourError = LrColor(0.8, 0.2, 0.2)
+
+-- Text with spaces removed from both ends
+local function trim(text)
+    return (text:match("^%s*(.-)%s*$"))
+end
+
+-- Split a comma-separated string into a list of trimmed, non-empty keywords
+local function splitKeywords(str)
+    local list = {}
+    for part in (str or ""):gmatch("[^,]+") do
+        local trimmed = trim(part)
+        if trimmed ~= "" then
+            table.insert(list, trimmed)
+        end
+    end
+    return list
+end
 
 -- Width and height of a JPEG, read from its header (nil if not found)
 local function jpegSize(data)
@@ -139,14 +160,27 @@ local function exportThumbnail(photo)
 end
 
 -- Date and place recorded for the photo, as text for the prompt (nil if
--- none), plus the list of place names (used to keep them out of keywords)
-local function getPhotoFacts(photo)
+-- none), plus the list of place names (used to keep them out of keywords).
+-- raw and formatted are optional: the photo's metadata already read in bulk
+-- (batch mode); without them each field is read from the photo.
+local function getPhotoFacts(photo, raw, formatted)
+    local function readRaw(field)
+        if raw then return raw[field] end
+        local ok, value = LrTasks.pcall(function() return photo:getRawMetadata(field) end)
+        return ok and value or nil
+    end
+    local function readFormatted(field)
+        if formatted then return formatted[field] end
+        local ok, value = LrTasks.pcall(function() return photo:getFormattedMetadata(field) end)
+        return ok and value or nil
+    end
+
     local lines = {}
 
     local time
     for _, field in ipairs({ "dateTimeOriginal", "dateTime" }) do
-        local ok, value = LrTasks.pcall(function() return photo:getRawMetadata(field) end)
-        if ok and type(value) == "number" then
+        local value = readRaw(field)
+        if type(value) == "number" then
             time = value
             break
         end
@@ -157,8 +191,8 @@ local function getPhotoFacts(photo)
 
     local places = {}
     for _, field in ipairs({ "location", "city", "stateProvince", "country" }) do
-        local ok, value = LrTasks.pcall(function() return photo:getFormattedMetadata(field) end)
-        if ok and type(value) == "string" and value:match("%S") then
+        local value = readFormatted(field)
+        if type(value) == "string" and value:match("%S") then
             table.insert(places, value)
         end
     end
@@ -172,24 +206,17 @@ local function getPhotoFacts(photo)
     return table.concat(lines, "\n"), places
 end
 
+-- The image file as Base64 text (nil if it can't be read; the caller reports it)
 local function base64EncodeImage(imagePath)
-
-    -- Read the image file as binary
-    local file = io.open(imagePath, "rb") -- Open the file in binary mode
+    local file = io.open(imagePath, "rb")
     if not file then
-        LrDialogs.message("Error", "Could not open file: " .. imagePath, "critical")
-        return
+        logger:warn("Could not open thumbnail file: " .. imagePath)
+        return nil
     end
-
-    local binaryData = file:read("*all") -- Read the entire file as binary data
-    file:close() -- Close the file
-
-    -- Encode the binary data to Base64
-    local base64Data = LrStringUtils.encodeBase64(binaryData)
-
-    return base64Data
+    local binaryData = file:read("*all")
+    file:close()
+    return LrStringUtils.encodeBase64(binaryData)
 end
-
 
 -- Replace em dashes with commas: "a long day — and night" -> "a long day, and night"
 local function removeEmDashes(text)
@@ -205,7 +232,7 @@ end
 
 -- Build the system and user prompts sent to the model. Shared by the request
 -- itself and the "Preview prompt" box, so the preview always matches.
-local function buildPrompts(prompt, currentData, useCurrentData, useSystemPrompt)
+local function buildPrompts(prompt, currentData, useCurrentData)
     currentData = currentData or {}
 
     -- Build the user prompt, adding existing metadata as context when requested
@@ -230,22 +257,29 @@ local function buildPrompts(prompt, currentData, useCurrentData, useSystemPrompt
             .. "Do not use these place names as keywords, but do give the type of place (for example park, lake, beach). "
             .. "The place names do not count towards the 7 to 15 keywords.\n"
     end
-    if userPrompt ~= "" then
-        userPrompt = userPrompt .. "\n"
+    -- Anything typed in the "Additional prompt text" box goes last
+    local extra = trim(prompt or "")
+    if extra ~= "" then
+        if userPrompt ~= "" then
+            userPrompt = userPrompt .. "\n"
+        end
+        userPrompt = userPrompt .. extra
     end
-    userPrompt = userPrompt .. (prompt or "")
+    -- Ollama treats an empty prompt as "load the model only" and gives no
+    -- answer, so a request with nothing else to say still needs a line
+    if userPrompt == "" then
+        userPrompt = "Caption this photo."
+    end
 
     -- System prompt: short and direct, which small vision models follow best.
     -- No sample answer, as small models tend to copy words from one.
-    local systemPrompt
-    if useSystemPrompt then
-        systemPrompt = [[You write photo metadata. Look at the image and return a JSON object with a "title", a "caption" and a list of "keywords". Write in English.
+    local systemPrompt = [[You write photo metadata. Caption the photo you are given: look at the image and return a JSON object with a "title", a "caption" and a list of "keywords". Write in English.
 
 Title: one sentence or phrase, like a news headline, covering who, what, where and the mood of the scene. Mention angle or perspective if notable. No colons, no keyword lists, no repeated words.
 
 Caption: two to four sentences (about 40 to 80 words) that read as a natural description, not a list.
 - Open with the main subject and what is happening, then the setting, then light, weather or time of day, then the mood.
-- Use concrete visual details such as colours, textures, light and composition rather than vague praise. Avoid words like "stunning", "beautiful", "breathtaking", "captivating" and "serene".
+- Use concrete visual details such as light, textures and composition rather than vague praise. Avoid words like "stunning", "beautiful", "breathtaking", "captivating" and "serene".
 - Write in the present tense and third person, in plain declarative sentences. Never start with "This image", "This photo", "The photo captures" or "In this picture".
 - Add something the title does not say. Do not restate the title or reuse its opening words.
 - Work any given names, places or events into the sentences naturally.
@@ -253,9 +287,9 @@ Caption: two to four sentences (about 40 to 80 words) that read as a natural des
 - Use commas and full stops. Do not use em dashes or dashes between clauses.
 
 Keywords: 7 to 15 specific keywords, not counting any names of people or places you were given. Cover each of these where it applies:
-- main subject (for example woman, dog, lighthouse)
+- main subject or subjects (for example woman, dog, lighthouse)
 - type of photo, always one (for example portrait, landscape, close-up, street)
-- clothing style, one keyword for the whole outfit (for example casual clothing, formal wear, sportswear)
+- clothing style, one general keyword for the whole outfit (for example casual clothing, formal wear, sportswear)
 - notable objects (for example kayak, bicycle, umbrella)
 - setting and place (for example park, lake, forest, street)
 - season and weather (for example autumn, raining)
@@ -269,7 +303,7 @@ Keyword rules:
 - For a named person, also give the general word (for example woman, man, child). For a named place, give the type of place (for example park, lake, beach).
 - One keyword per idea. Never give variants of the same idea such as "outdoor", "outdoors" and "outdoor setting"; pick one. Do not add a more detailed version of a keyword you already have, such as "autumn colours" next to "autumn" or "pine tree" next to "tree"; pick one.
 - Do not pad keywords with words like "setting", "scene", "view" or "area".
-- Never give a colour on its own (such as "orange" or "blue") because one object has that colour. When an object's colour is notable, give colour and object as one keyword (for example "orange sunglasses") instead of the object alone. A colour on its own is only for the main colour or tone of the whole image.
+- Never give a colour on its own (such as "orange" or "blue") because one object has that colour. Mention an object's colour only when it stands out in the photo, and then give colour and object as one keyword (for example "orange sunglasses"). A colour on its own is only for the main colour or tone of the whole image.
 - Describe things, not their properties. Do not give the material, texture, size, shape or pattern of a single object ("wooden", "leather", "small", "round", "striped"), or body parts in an ordinary photo of a person ("hand", "face", "hair"), unless they are the subject, such as a close-up of hands or wood grain.
 - Do not give single items of clothing or accessories worn by a person (such as "jeans", "top", "belt", "shoes", "watch"). Give one clothing style keyword for the whole outfit instead. A single item gets its own keyword only when the photo is about it or it stands out, such as a costume, a uniform, a wedding dress or a bright red coat.
 - No counts such as "two", "pair" or "group of three".
@@ -278,10 +312,7 @@ Keyword rules:
 - No camera details, links or trademarks, and no generic words like "photo" or "image".
 - Final check before answering: every main person, animal and object in the photo has a keyword (for a named person, the general word such as "woman" counts), and nothing small or far away in the background has one.
 
-Only describe what is visible or given to you as fact. Do not guess names, places or dates.]]
-    else
-        systemPrompt = [[Return a JSON object with a "title" (string), a "caption" (string) and "keywords" (a list of strings) describing the image. Write in English.]]
-    end
+Describe only what is visible or given to you as fact. Do not invent names of people or places, or dates, that you were not given.]]
 
     -- Keyword vocabulary (only when offerVocabularyToModel is on) goes in the
     -- system prompt, straight after the fixed instructions.
@@ -294,39 +325,47 @@ Only describe what is visible or given to you as fact. Do not guess names, place
     end
 
     -- Anything that differs from photo to photo goes after the vocabulary
-    if useSystemPrompt and useCurrentData then
+    if useCurrentData then
         systemPrompt = systemPrompt .. "\n\nThe photo already has a title and caption, given in the request. Improve on them but keep their meaning and any names, places and facts they contain."
     end
 
     return systemPrompt, userPrompt
 end
 
----@param photo LrPhoto The photo to send to the API
----@param prompt string The prompt to send to the API
----@param currentData table (optional) The current title, caption, and keywords of the photo
----@param useCurrentData boolean (optional) Whether to use the current title and caption
----@param useSystemPrompt boolean (optional) Whether to use the system prompt
+-- Sends the photo and prompts to Ollama and returns the reply as a table
+-- with title, caption and keywords. On failure returns nil, a message for the
+-- user, and a kind ("timeout" or "badjson") when retrying might help.
+---@param photo LrPhoto The photo to send
+---@param prompt string Additional prompt text from the dialog (may be empty)
+---@param currentData table (optional) title, caption, contextKeywords, vocabulary, photoFacts, excludeKeys,
+---       and thumbnailPath (an already exported thumbnail to reuse; it is not deleted)
+---@param useCurrentData boolean (optional) Whether to send the current title and caption
 ---@param modelName string (optional) Ollama model to use; defaults to the model set at the top of this file
----@return table response The response from the API
-local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSystemPrompt, modelName)
-    local useModel = (type(modelName) == "string" and modelName:match("^%s*(.-)%s*$")) or ""
+local function sendDataToApi(photo, prompt, currentData, useCurrentData, modelName)
+    local useModel = (type(modelName) == "string" and trim(modelName)) or ""
     if useModel == "" then
         useModel = model
     end
     logger:info("Sending data to API using model " .. useModel)
-    local thumbPath = exportThumbnail(photo)
-    if not thumbPath then
-        return nil, "Could not create a thumbnail for this photo."
-    end
-    local encodedImage = base64EncodeImage(thumbPath)
-    LrFileUtils.delete(thumbPath) -- temporary file no longer needed
-    if not encodedImage then
-        return nil, "Could not read the thumbnail file."
-    end
-    local url = "http://localhost:11434/api/generate"
     currentData = currentData or {}
 
-    local systemPrompt, userPrompt = buildPrompts(prompt, currentData, useCurrentData, useSystemPrompt)
+    -- Reuse the thumbnail already made (single-photo dialog) when there is
+    -- one; otherwise make one for this request and delete it afterwards
+    local encodedImage = currentData.thumbnailPath and base64EncodeImage(currentData.thumbnailPath)
+    if not encodedImage then
+        local thumbPath = exportThumbnail(photo)
+        if not thumbPath then
+            return nil, "Could not create a thumbnail for this photo."
+        end
+        encodedImage = base64EncodeImage(thumbPath)
+        LrFileUtils.delete(thumbPath) -- temporary file no longer needed
+        if not encodedImage then
+            return nil, "Could not read the thumbnail file."
+        end
+    end
+    local url = "http://localhost:11434/api/generate"
+
+    local systemPrompt, userPrompt = buildPrompts(prompt, currentData, useCurrentData)
 
     -- Exact shape of the reply. Ollama constrains the model to this schema, so
     -- every reply has all three fields with the right types.
@@ -378,12 +417,13 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         postData.format = nil
     end
 
-    local response_data
     if noThinkSettingModels[useModel] then
         postData.think = nil
     end
 
-    for attempt = 1, 3 do
+    local response_data
+
+    for _ = 1, 3 do -- up to two retries, each dropping a setting the model rejected
         logger:info("Sending request to " .. url .. " (model " .. useModel .. ", JSON mode " ..
             (postData.format and "on" or "off") .. ", image " .. #encodedImage .. " bytes base64)")
 
@@ -450,13 +490,7 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
     text = text:gsub("<think>.-</think>", "")
     text = text:gsub("```%a*", "")
     local firstBrace = text:find("{", 1, true)
-    local lastBrace
-    for i = #text, 1, -1 do
-        if text:sub(i, i) == "}" then
-            lastBrace = i
-            break
-        end
-    end
+    local lastBrace = text:match(".*()}")
     if firstBrace and lastBrace and lastBrace > firstBrace then
         text = text:sub(firstBrace, lastBrace)
     end
@@ -479,30 +513,26 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         end
     end
 
-    -- Split any keyword containing commas ("Oslo, Norway" -> "Oslo", "Norway"),
-    -- as Lightroom itself does, so both dialogs save the same keywords
     if type(response_json.keywords) == "table" then
+        -- Split any keyword containing commas ("Oslo, Norway" -> "Oslo",
+        -- "Norway"), as Lightroom itself does, so both dialogs save the same
+        -- keywords
         local split = {}
         for _, keyword in ipairs(response_json.keywords) do
             if type(keyword) == "string" then
-                for part in keyword:gmatch("[^,]+") do
-                    local trimmed = part:match("^%s*(.-)%s*$")
-                    if trimmed ~= "" then
-                        table.insert(split, trimmed)
-                    end
+                for _, part in ipairs(splitKeywords(keyword)) do
+                    table.insert(split, part)
                 end
             end
         end
-        response_json.keywords = split
-    end
 
-    -- Enforce the keyword maximum, keeping the model's first (most relevant)
-    -- ones. Keywords the plugin drops later anyway (your own keywords and the
-    -- photo's place names, in currentData.excludeKeys) don't count towards it.
-    if type(response_json.keywords) == "table" then
+        -- Enforce the keyword maximum, keeping the model's first (most
+        -- relevant) ones. Keywords the plugin drops later anyway (your own
+        -- keywords and the photo's place names, in currentData.excludeKeys)
+        -- don't count towards it.
         local excludeKeys = currentData.excludeKeys or {}
         local kept, counted = {}, 0
-        for _, keyword in ipairs(response_json.keywords) do
+        for _, keyword in ipairs(split) do
             if excludeKeys[normaliseKeyword(keyword)] then
                 table.insert(kept, keyword)
             elseif counted < maxKeywords then
@@ -510,8 +540,8 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
                 table.insert(kept, keyword)
             end
         end
-        if #kept < #response_json.keywords then
-            logger:info("Model returned " .. #response_json.keywords .. " keywords; keeping the first " .. maxKeywords
+        if #kept < #split then
+            logger:info("Model returned " .. #split .. " keywords; keeping the first " .. maxKeywords
                 .. " (not counting your own keywords and place names)")
         end
         response_json.keywords = kept
@@ -527,9 +557,7 @@ local fillerWords = {
     environment = true, backdrop = true, surroundings = true
 }
 
--- Crude English singular: "trees" -> "tree", "berries" -> "berry",
--- "boxes" -> "box", "outdoors" -> "outdoor". Leaves "glass", "cactus" alone.
--- Plurals the simple rules below get wrong
+-- Plurals the simple rules in singularise get wrong
 local irregularPlurals = {
     leaves = "leaf", wolves = "wolf", knives = "knife", lives = "life", wives = "wife",
     halves = "half", shelves = "shelf", calves = "calf", loaves = "loaf", thieves = "thief",
@@ -551,6 +579,8 @@ local irregularPlurals = {
     christmas = "christmas", atlas = "atlas"
 }
 
+-- Crude English singular: "trees" -> "tree", "berries" -> "berry",
+-- "boxes" -> "box", "outdoors" -> "outdoor". Leaves "glass", "cactus" alone.
 local function singularise(word)
     if irregularPlurals[word] then return irregularPlurals[word] end
     if #word <= 3 then return word end
@@ -601,7 +631,7 @@ local function filterKeywords(keywords, excludeSet, vocabulary)
     local result, seen = {}, {}
     for _, keyword in ipairs(keywords or {}) do
         if type(keyword) == "string" then
-            local trimmed = keyword:match("^%s*(.-)%s*$")
+            local trimmed = trim(keyword)
             local key = normaliseKeyword(trimmed)
             if key ~= "" and not (excludeSet and excludeSet[key]) then
                 local existing = vocabulary and vocabulary.byKey[key]
@@ -626,17 +656,15 @@ local function addKeywordsWithParent(catalog, photo, keywords, excludeSet, vocab
         -- First create or get the parent 'llm' keyword
         local llmKeyword = catalog:createKeyword("llm", nil, true, nil, true)
 
+        -- filterKeywords never returns an empty keyword
         for _, keyword in ipairs(filterKeywords(keywords, excludeSet, vocabulary)) do
-            if keyword and keyword ~= "" then
-                -- Create child keyword under 'llm' parent (or reuse it if it exists)
-                local childKeyword = catalog:createKeyword(keyword, nil, true, llmKeyword, true)
-                -- Add the keyword object to the photo
-                photo:addKeyword(childKeyword)
-                -- Don't call childKeyword:getName() here: a keyword created in
-                -- this same catalog write isn't usable until the write ends,
-                -- and asking for its name fails ("attempt to index a nil value")
-                table.insert(added, keyword)
-            end
+            -- Create child keyword under 'llm' parent (or reuse it if it exists)
+            local childKeyword = catalog:createKeyword(keyword, nil, true, llmKeyword, true)
+            photo:addKeyword(childKeyword)
+            -- Don't call childKeyword:getName() here: a keyword created in
+            -- this same catalog write isn't usable until the write ends,
+            -- and asking for its name fails ("attempt to index a nil value")
+            table.insert(added, keyword)
         end
     end
     return added
@@ -699,83 +727,31 @@ local function vocabularyText(vocabulary)
     return table.concat(list, ", ")
 end
 
--- The photo's keywords under the 'llm' parent, as keyword objects
-local function getLlmKeywordObjects(photo)
-    local llmKeywords = {}
-    local allKeywords = photo:getRawMetadata("keywords")
-
-    if allKeywords then
-        for _, keyword in ipairs(allKeywords) do
-            local parent = keyword:getParent()
-            if parent and parent:getName() == "llm" then
-                table.insert(llmKeywords, keyword)
-            end
-        end
-    end
-
-    return llmKeywords
-end
-
-local function getLlmKeywordsFromPhoto(photo)
-    local names = {}
-    for _, keyword in ipairs(getLlmKeywordObjects(photo)) do
-        table.insert(names, keyword:getName())
-    end
-    return names
-end
-
--- Keywords you assigned yourself (everything not under the 'llm' parent)
-local function getUserKeywordsFromPhoto(photo)
-    local userKeywords = {}
-    local allKeywords = photo:getRawMetadata("keywords")
-
-    if allKeywords then
-        for _, keyword in ipairs(allKeywords) do
-            local parent = keyword:getParent()
-            local isLlm = (parent and parent:getName() == "llm") or keyword:getName() == "llm"
-            if not isLlm then
-                table.insert(userKeywords, keyword:getName())
-            end
-        end
-    end
-
-    return userKeywords
-end
-
--- Set of your own keywords (and their synonyms) on the photo, normalised for matching
-local function getUserKeywordSet(photo)
-    local set = {}
-    local allKeywords = photo:getRawMetadata("keywords")
-
-    if allKeywords then
-        for _, keyword in ipairs(allKeywords) do
-            local parent = keyword:getParent()
-            local isLlm = (parent and parent:getName() == "llm") or keyword:getName() == "llm"
-            if not isLlm then
-                set[normaliseKeyword(keyword:getName())] = true
-                local ok, synonyms = pcall(function() return keyword:getSynonyms() end)
-                if ok and type(synonyms) == "table" then
-                    for _, synonym in ipairs(synonyms) do
-                        set[normaliseKeyword(synonym)] = true
-                    end
+-- Sorts a photo's keywords (from getRawMetadata("keywords")) in one pass:
+--   llm      the keywords under the 'llm' parent, as keyword objects
+--   llmNames their names
+--   userNames  your own keywords (everything except 'llm' and its children)
+--   userSet    your own keywords and their synonyms, normalised for matching
+local function sortKeywords(keywords)
+    local result = { llm = {}, llmNames = {}, userNames = {}, userSet = {} }
+    for _, keyword in ipairs(keywords or {}) do
+        local name = keyword:getName()
+        local parent = keyword:getParent()
+        if parent and parent:getName() == "llm" then
+            table.insert(result.llm, keyword)
+            table.insert(result.llmNames, name)
+        elseif name ~= "llm" then
+            table.insert(result.userNames, name)
+            result.userSet[normaliseKeyword(name)] = true
+            local ok, synonyms = pcall(function() return keyword:getSynonyms() end)
+            if ok and type(synonyms) == "table" then
+                for _, synonym in ipairs(synonyms) do
+                    result.userSet[normaliseKeyword(synonym)] = true
                 end
             end
         end
     end
-
-    return set
-end
-
--- Split a comma-separated string into a list of trimmed, non-empty keywords
-local function splitKeywords(str)
-    local list = {}
-    for keyword in string.gmatch(str or "", "([^,]+)") do
-        local trimmed = keyword:match("^%s*(.-)%s*$")
-        if trimmed ~= "" then
-            table.insert(list, trimmed)
-        end
-    end
-    return list
+    return result
 end
 
 -- Errors that will hit every photo, so there's no point continuing the batch
@@ -792,10 +768,9 @@ local function runBatch(catalog, photos)
 
     LrFunctionContext.callWithContext("showLlamaBatchDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
-        props.prompt = "Caption this photo"
+        props.prompt = "" -- additional prompt text; the task itself is in the system prompt
         props.useCurrentData = true
         props.useContextKeywords = true
-        props.useSystemPrompt = true
         props.model = model -- editable in the dialog; not saved
         props.batchKeywords = ""
         props.applyBatchKeywords = true
@@ -812,7 +787,7 @@ local function runBatch(catalog, photos)
                 height_in_lines = 2
             },
             f:spacer{ height = 10 },
-            f:static_text{ title = "Prompt:" },
+            f:static_text{ title = "Additional prompt text (optional):" },
             f:spacer{ f:label_spacing{} },
             f:edit_field{
                 value = LrView.bind("prompt"),
@@ -838,11 +813,6 @@ local function runBatch(catalog, photos)
             f:checkbox{
                 title = "Skip photos that already have a caption",
                 value = LrView.bind("skipCaptioned")
-            },
-            f:spacer{ height = 6 },
-            f:checkbox{
-                title = "Use system prompt",
-                value = LrView.bind("useSystemPrompt")
             },
             f:spacer{ height = 10 },
             f:separator{ width = 420 },
@@ -892,7 +862,6 @@ local function runBatch(catalog, photos)
                 prompt = props.prompt,
                 useCurrentData = props.useCurrentData,
                 useContextKeywords = props.useContextKeywords,
-                useSystemPrompt = props.useSystemPrompt,
                 batchKeywords = splitKeywords(props.batchKeywords),
                 applyBatchKeywords = props.applyBatchKeywords,
                 usePhotoFacts = props.usePhotoFacts,
@@ -914,6 +883,24 @@ local function runBatch(catalog, photos)
     -- matched in code via 'vocabulary'.
     local frozenVocabularyText = offerVocabularyToModel and vocabularyText(vocabulary) or nil
 
+    -- Read every photo's details in two catalog calls up front, rather than
+    -- several calls per photo. If that fails, each photo is read on its own.
+    local okRaw, rawByPhoto = LrTasks.pcall(function()
+        return catalog:batchGetRawMetadata(photos, { "keywords", "dateTimeOriginal", "dateTime" })
+    end)
+    local okFormatted, formattedByPhoto = LrTasks.pcall(function()
+        return catalog:batchGetFormattedMetadata(photos,
+            { "fileName", "title", "caption", "location", "city", "stateProvince", "country" })
+    end)
+    if not (okRaw and type(rawByPhoto) == "table") then
+        logger:warn("Could not read photo details in bulk: " .. tostring(rawByPhoto))
+        rawByPhoto = {}
+    end
+    if not (okFormatted and type(formattedByPhoto) == "table") then
+        logger:warn("Could not read photo details in bulk: " .. tostring(formattedByPhoto))
+        formattedByPhoto = {}
+    end
+
     local progress = LrProgressScope({ title = "Lightroom Llama: captioning " .. #photos .. " photos" })
     local succeeded, failures = 0, {}
     local consecutiveTimeouts = 0
@@ -923,18 +910,33 @@ local function runBatch(catalog, photos)
     -- Captions one photo. Returns a message when the whole batch should stop,
     -- otherwise nil.
     local function processPhoto(i, photo, fileName)
-        if options.skipCaptioned and (photo:getFormattedMetadata("caption") or ""):match("%S") then
+        -- This photo's details, from the bulk read when available
+        local raw, formatted = rawByPhoto[photo], formattedByPhoto[photo]
+        local title, caption
+        if formatted then
+            title, caption = formatted.title, formatted.caption
+        else
+            title, caption = photo:getFormattedMetadata("title"), photo:getFormattedMetadata("caption")
+        end
+        title, caption = title or "", caption or ""
+
+        if options.skipCaptioned and caption:match("%S") then
             skipped = skipped + 1
             logger:info(fileName .. ": skipped (already has a caption)")
             return nil
         end
 
-        -- Gather this photo's own metadata
-        local title = photo:getFormattedMetadata("title") or ""
-        local caption = photo:getFormattedMetadata("caption") or ""
+        local keywords
+        if raw then
+            keywords = raw.keywords
+        else
+            keywords = photo:getRawMetadata("keywords")
+        end
+        local sorted = sortKeywords(keywords)
+
         local contextList = {}
         if options.useContextKeywords then
-            contextList = getUserKeywordsFromPhoto(photo)
+            contextList = sorted.userNames
         end
         for _, keyword in ipairs(options.batchKeywords) do
             table.insert(contextList, keyword)
@@ -942,7 +944,7 @@ local function runBatch(catalog, photos)
         contextList = filterKeywords(contextList, nil)
 
         -- Keywords the photo has (or will have) that must not be repeated under 'llm'
-        local excludeSet = getUserKeywordSet(photo)
+        local excludeSet = sorted.userSet
         if options.applyBatchKeywords then
             for _, keyword in ipairs(options.batchKeywords) do
                 excludeSet[normaliseKeyword(keyword)] = true
@@ -952,7 +954,7 @@ local function runBatch(catalog, photos)
         -- Date and location, given as background; place names never become keywords
         local photoFacts, photoPlaces
         if options.usePhotoFacts then
-            photoFacts, photoPlaces = getPhotoFacts(photo)
+            photoFacts, photoPlaces = getPhotoFacts(photo, raw, formatted)
             excludePlaces(excludeSet, photoPlaces)
         end
 
@@ -966,14 +968,15 @@ local function runBatch(catalog, photos)
             excludeKeys = excludeSet
         }
         local apiResponse, err, errKind = sendDataToApi(photo, options.prompt, requestData,
-            useCurrent, options.useSystemPrompt, options.model)
+            useCurrent, options.model)
 
-        -- A timed-out photo gets one more try before being counted as failed
+        -- A photo that times out or gets a broken reply has one more try
+        -- before being counted as failed
         if not apiResponse and (errKind == "timeout" or errKind == "badjson") and not progress:isCanceled() then
             logger:warn(fileName .. ": " .. errKind .. ", retrying once")
             progress:setCaption("Photo " .. i .. " of " .. #photos .. ": " .. fileName .. " (retrying)")
             apiResponse, err, errKind = sendDataToApi(photo, options.prompt, requestData,
-                useCurrent, options.useSystemPrompt, options.model)
+                useCurrent, options.model)
         end
 
         if errKind == "timeout" then
@@ -985,10 +988,11 @@ local function runBatch(catalog, photos)
         if apiResponse then
             local okWrite, writeErr = LrTasks.pcall(function()
                 catalog:withWriteAccessDo("Llama metadata: " .. fileName, function()
-                    if apiResponse.title and apiResponse.title ~= "" then
+                    -- A blank title or caption never replaces the current one
+                    if type(apiResponse.title) == "string" and apiResponse.title:match("%S") then
                         photo:setRawMetadata("title", apiResponse.title)
                     end
-                    if apiResponse.caption and apiResponse.caption ~= "" then
+                    if type(apiResponse.caption) == "string" and apiResponse.caption:match("%S") then
                         photo:setRawMetadata("caption", apiResponse.caption)
                     end
                     if type(apiResponse.keywords) == "table" then
@@ -1030,7 +1034,10 @@ local function runBatch(catalog, photos)
         progress:setPortionComplete(i - 1, #photos)
 
         local fileName = "photo " .. i
-        local okName, name = LrTasks.pcall(function() return photo:getFormattedMetadata("fileName") end)
+        local okName, name = true, formattedByPhoto[photo] and formattedByPhoto[photo].fileName
+        if not name then
+            okName, name = LrTasks.pcall(function() return photo:getFormattedMetadata("fileName") end)
+        end
         if okName and type(name) == "string" and name ~= "" then
             fileName = name
         end
@@ -1074,13 +1081,11 @@ local function runBatch(catalog, photos)
 end
 
 local function main()
-    -- Get the active catalog
     local catalog = LrApplication.activeCatalog()
 
-    -- Get the selected photo
-    local selectedPhotos = catalog:getTargetPhotos() -- Gets all selected photos
+    local selectedPhotos = catalog:getTargetPhotos()
     if #selectedPhotos == 0 then
-        LrDialogs.message("No photo selected", "Please select a photo to view.", "critical")
+        LrDialogs.message("No photo selected", "Please select one or more photos.", "critical")
         return
     end
 
@@ -1097,28 +1102,32 @@ local function main()
     LrFunctionContext.callWithContext("showLlamaDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
         props.status = "Ready"
-        props.statusColor = LrColor(0.149, 0.616, 0.412)
-        props.prompt = "Caption this photo"
-        props.title = selectedPhoto:getFormattedMetadata('title')
-        props.caption = selectedPhoto:getFormattedMetadata('caption')
-        -- Initialize keywords with existing llm keywords
-        local existingLlmKeywords = getLlmKeywordsFromPhoto(selectedPhoto)
-        props.keywords = table.concat(existingLlmKeywords, ", ")
+        props.statusColor = colourReady
+        props.prompt = "" -- additional prompt text; the task itself is in the system prompt
+        props.title = selectedPhoto:getFormattedMetadata("title") or ""
+        props.caption = selectedPhoto:getFormattedMetadata("caption") or ""
+        local sorted = sortKeywords(selectedPhoto:getRawMetadata("keywords"))
+        -- Start with the photo's existing llm keywords
+        props.keywords = table.concat(sorted.llmNames, ", ")
         -- Your own keywords, passed to the model as context (editable in the dialog)
-        props.contextKeywords = table.concat(getUserKeywordsFromPhoto(selectedPhoto), ", ")
+        props.contextKeywords = table.concat(sorted.userNames, ", ")
         -- Keywords already on the photo; these are never repeated under 'llm'
-        local userKeywordSet = getUserKeywordSet(selectedPhoto)
+        local userKeywordSet = sorted.userSet
         -- Existing llm keywords in the catalog, offered to the model for reuse
         local vocabulary = getLlmVocabulary(catalog)
         local frozenVocabularyText = offerVocabularyToModel and vocabularyText(vocabulary) or nil
         props.useContextKeywords = props.contextKeywords ~= ""
-        props.response = ""
         props.useCurrentData = props.title ~= "" or props.caption ~= ""
         props.usePhotoFacts = photoFacts ~= nil
-        props.useSystemPrompt = true
         props.model = model -- editable in the dialog; not saved
         props.elapsed = "" -- generation time, shown after each run
         props.canGenerate = true -- false while a request is running
+
+        -- "Use current title and caption" only applies when there is a title
+        -- or caption to send (batch mode does the same)
+        local function sendCurrentData()
+            return props.useCurrentData and ((props.title or "") ~= "" or (props.caption or "") ~= "")
+        end
 
         -- "Preview prompt": read-only view of exactly what will be sent
         props.showPromptPreview = false
@@ -1133,40 +1142,105 @@ local function main()
                 contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
                 vocabulary = frozenVocabularyText,
                 photoFacts = props.usePhotoFacts and photoFacts or nil
-            }, props.useCurrentData, props.useSystemPrompt)
-            props.promptPreview = "SYSTEM PROMPT" .. (props.useSystemPrompt and "" or " (minimal, \"Use system prompt\" is off)") .. ":\n"
+            }, sendCurrentData())
+            props.promptPreview = "SYSTEM PROMPT:\n"
                 .. systemPrompt
                 .. "\n\nUSER PROMPT:\n" .. userPrompt
                 .. "\n\nALSO SENT: the photo (" .. thumbnailSize .. " px), and the required reply format (title, caption, keywords)."
         end
-        for _, key in ipairs({ "showPromptPreview", "prompt", "useSystemPrompt", "useCurrentData",
+        for _, key in ipairs({ "showPromptPreview", "prompt", "useCurrentData",
                                "title", "caption", "useContextKeywords", "contextKeywords", "usePhotoFacts" }) do
             props:addObserver(key, updatePromptPreview)
         end
 
-        -- Create a view factory
-        local f = LrView.osFactory()
+        -- Generate: runs the request in the background and fills the boxes
+        local function onGenerate()
+            props.canGenerate = false
+            props.status = "The llama is thinking..."
+            props.statusColor = colourBusy
+            props.elapsed = ""
 
-        -- Define the dialog contents
-        local c = f:view{
-            bind_to_object = props,
-            f:row{f:column{
-                f:picture{
-                    value = thumbnailPath,
-                    frame_width = 2,
-                    width = 400,
-                    height = 400
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:checkbox{
-                    title = "Preview prompt",
-                    value = LrView.bind("showPromptPreview")
-                },
-                f:spacer{
-                    height = 6
-                },
+            local function showError(message)
+                props.elapsed = ""
+                logger:error(message)
+                props.status = "Error"
+                props.statusColor = colourError
+                LrDialogs.message("Lightroom Llama", message or "Unknown error", "critical")
+            end
+
+            local function generate()
+                local startTime = LrDate.currentTime()
+                -- Keywords never added under llm: your own keywords and, as
+                -- they are background only, the photo's place names (you can
+                -- still type a place name into the box yourself)
+                local excludeSet = {}
+                for key in pairs(userKeywordSet) do
+                    excludeSet[key] = true
+                end
+                if props.usePhotoFacts then
+                    excludePlaces(excludeSet, photoPlaces)
+                end
+                local apiResponse, err, errKind
+                for _ = 1, 2 do
+                    apiResponse, err, errKind = sendDataToApi(selectedPhoto, props.prompt, {
+                        title = props.title,
+                        caption = props.caption,
+                        contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
+                        vocabulary = frozenVocabularyText,
+                        photoFacts = props.usePhotoFacts and photoFacts or nil,
+                        excludeKeys = excludeSet,
+                        thumbnailPath = thumbnailPath
+                    }, sendCurrentData(), props.model)
+                    -- One automatic retry when the reply comes back broken
+                    if apiResponse or errKind ~= "badjson" then
+                        break
+                    end
+                    logger:warn("Invalid JSON reply, retrying once")
+                    props.status = "Retrying..."
+                end
+
+                if not apiResponse then
+                    showError(err)
+                    return
+                end
+
+                -- A blank title or caption never replaces the current one
+                if type(apiResponse.title) == "string" and apiResponse.title:match("%S") then
+                    props.title = apiResponse.title
+                end
+                if type(apiResponse.caption) == "string" and apiResponse.caption:match("%S") then
+                    props.caption = apiResponse.caption
+                end
+                -- Convert keywords array to comma-separated string for display
+                if type(apiResponse.keywords) == "table" then
+                    props.keywords = table.concat(filterKeywords(apiResponse.keywords, excludeSet, vocabulary), ", ")
+                else
+                    props.keywords = ""
+                end
+                props.elapsed = string.format("%d s", math.floor(LrDate.currentTime() - startTime + 0.5))
+                props.status = "Ready"
+                props.statusColor = colourReady
+            end
+
+            LrTasks.startAsyncTask(function()
+                local ok, problem = LrTasks.pcall(generate)
+                if not ok then
+                    showError("Something went wrong: " .. tostring(problem))
+                end
+                -- Always turn the button back on, even after an error
+                props.canGenerate = true
+            end)
+        end
+
+        local f = LrView.osFactory()
+        local c = f:view{ bind_to_object = props, f:row{
+            -- Left: the photo and the prompt preview
+            f:column{
+                width = 400,
+                f:picture{ value = thumbnailPath, frame_width = 2, width = 400, height = 400 },
+                f:spacer{ height = 10 },
+                f:checkbox{ title = "Preview prompt", value = LrView.bind("showPromptPreview") },
+                f:spacer{ height = 6 },
                 f:scrolled_view{
                     visible = LrView.bind("showPromptPreview"),
                     width = 400,
@@ -1175,221 +1249,90 @@ local function main()
                     f:static_text{
                         title = LrView.bind("promptPreview"),
                         width = 370,
-                        height_in_lines = 60,
+                        -- Lightroom sizes this once, when the dialog opens, and
+                        -- clips anything longer. The full system prompt alone
+                        -- wraps to about 100 lines at this width, so leave room
+                        -- for it plus a long user prompt.
+                        height_in_lines = 160,
                         selectable = true
                     }
-                },
-                width = 400
-            }, f:spacer{
-                width = 10
-            }, f:column{
-                f:column{f:static_text{
-                    title = "Title:"
-                }, f:spacer{f:label_spacing{}}, f:edit_field{
-                    value = LrView.bind("title"), -- Bind to the new response property
-                    width = 400
-                }},
-                f:spacer{
-                    height = 10
-                },
-                f:static_text{
-                    title = "Caption:",
-                    alignment = 'left'
-                },
-                f:spacer{f:label_spacing{}},
-                f:edit_field{
-                    value = LrView.bind("caption"), -- Bind to the new response property
-                    width = 400,
-                    height = 100
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:static_text{
-                    title = "Keywords:",
-                    alignment = 'left'
-                },
-                f:spacer{f:label_spacing{}},
-                f:edit_field{
-                    value = LrView.bind("keywords"),
-                    width = 400,
-                    height = 60
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:separator{
-                    width = 400
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:static_text{
-                    title = "Prompt:",
-                    alignment = 'left'
-                },
-                f:spacer{f:label_spacing{}},
-                f:edit_field{
-                    value = LrView.bind("prompt"),
-                    immediate = true, -- keep the prompt preview in step while typing
-                    width = 400,
-                    height = 60
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:checkbox{
-                    title = "Use current title and caption",
-                    value = LrView.bind("useCurrentData")
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:checkbox{
-                    title = "Use existing keywords as context:",
-                    value = LrView.bind("useContextKeywords")
-                },
-                f:spacer{f:label_spacing{}},
+                }
+            },
+            f:spacer{ width = 10 },
+            -- Right: the results, then the options and Generate.
+            -- "immediate" keeps the prompt preview in step while typing.
+            f:column{
+                width = 400,
+                f:static_text{ title = "Title:" },
+                f:spacer{ f:label_spacing{} },
+                f:edit_field{ value = LrView.bind("title"), immediate = true, width = 400 },
+                f:spacer{ height = 10 },
+                f:static_text{ title = "Caption:" },
+                f:spacer{ f:label_spacing{} },
+                f:edit_field{ value = LrView.bind("caption"), immediate = true, width = 400, height = 100 },
+                f:spacer{ height = 10 },
+                f:static_text{ title = "Keywords:" },
+                f:spacer{ f:label_spacing{} },
+                f:edit_field{ value = LrView.bind("keywords"), width = 400, height = 60 },
+                f:spacer{ height = 10 },
+                f:separator{ width = 400 },
+                f:spacer{ height = 10 },
+                f:static_text{ title = "Additional prompt text (optional):" },
+                f:spacer{ f:label_spacing{} },
+                f:edit_field{ value = LrView.bind("prompt"), immediate = true, width = 400, height = 60 },
+                f:spacer{ height = 10 },
+                f:checkbox{ title = "Use current title and caption", value = LrView.bind("useCurrentData") },
+                f:spacer{ height = 10 },
+                f:checkbox{ title = "Use existing keywords as context:", value = LrView.bind("useContextKeywords") },
+                f:spacer{ f:label_spacing{} },
                 f:edit_field{
                     value = LrView.bind("contextKeywords"),
                     enabled = LrView.bind("useContextKeywords"),
+                    immediate = true,
                     width = 400,
                     height = 40
                 },
-                f:spacer{
-                    height = 10
-                },
+                f:spacer{ height = 10 },
                 f:checkbox{
                     title = "Use date and location" .. (photoFacts and (": " .. photoFacts:gsub("\n", "; ")) or " (none recorded)"),
                     value = LrView.bind("usePhotoFacts"),
                     enabled = photoFacts ~= nil,
                     width = 400
                 },
-                f:spacer{
-                    height = 10
+                f:spacer{ height = 10 },
+                f:separator{ width = 400 },
+                f:spacer{ height = 10 },
+                f:row{
+                    f:static_text{ title = "Model:" },
+                    f:edit_field{
+                        value = LrView.bind("model"),
+                        width_in_chars = 16,
+                        tooltip = "Any Ollama vision model you have installed (see 'ollama list')"
+                    },
+                    f:static_text{
+                        title = LrView.bind("elapsed"),
+                        width_in_chars = 6,
+                        text_color = LrColor(0.0, 0.35, 0.85),
+                        tooltip = "Time taken by the last generation"
+                    },
+                    f:static_text{
+                        title = LrView.bind("status"),
+                        alignment = "right",
+                        width = 160,
+                        font = "<system/bold>",
+                        text_color = LrView.bind("statusColor")
+                    }
                 },
-                f:checkbox{
-                    title = "Use system prompt",
-                    value = LrView.bind("useSystemPrompt")
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:separator{
-                    width = 400
-                },
-                f:spacer{
-                    height = 10
-                },
-                f:row{f:static_text{
-                    title = "Model:"
-                }, f:edit_field{
-                    value = LrView.bind("model"),
-                    width_in_chars = 16,
-                    tooltip = "Any Ollama vision model you have installed (see 'ollama list')"
-                }, f:static_text{
-                    title = LrView.bind("elapsed"),
-                    width_in_chars = 6,
-                    text_color = LrColor(0.0, 0.35, 0.85),
-                    tooltip = "Time taken by the last generation"
-                }, f:static_text{
-                    alignment = 'right',
-                    title = LrView.bind("status"),
-                    width = 160,
-                    font = "<system/bold>",
-                    text_color = LrView.bind("statusColor")
-                }},
-                f:spacer{
-                    height = 10
-                },
-                f:row{f:push_button{
+                f:spacer{ height = 10 },
+                f:row{ f:push_button{
                     title = "Generate",
                     enabled = LrView.bind("canGenerate"), -- off while a request is running
-                    action = function()
-                        props.canGenerate = false
-                        props.status = "The llama is thinking..."
-                        props.statusColor = LrColor(0.439, 0.345, 0.745)
-                        props.elapsed = ""
+                    action = onGenerate
+                } },
+                f:spacer{ height = 20 }
+            }
+        } }
 
-                        local function showError(message)
-                            props.elapsed = ""
-                            logger:error(message)
-                            props.status = "Error"
-                            props.statusColor = LrColor(0.8, 0.2, 0.2)
-                            LrDialogs.message("Lightroom Llama", message or "Unknown error", "critical")
-                        end
-
-                        local function generate()
-                            local startTime = LrDate.currentTime()
-                            -- Keywords never added under llm: your own keywords and, as
-                            -- they are background only, the photo's place names (you can
-                            -- still type a place name into the box yourself)
-                            local excludeSet = {}
-                            for key in pairs(userKeywordSet) do
-                                excludeSet[key] = true
-                            end
-                            if props.usePhotoFacts then
-                                excludePlaces(excludeSet, photoPlaces)
-                            end
-                            local apiResponse, err, errKind
-                            for attempt = 1, 2 do
-                                apiResponse, err, errKind = sendDataToApi(selectedPhoto, props.prompt, {
-                                    title = props.title,
-                                    caption = props.caption,
-                                    contextKeywords = props.useContextKeywords and props.contextKeywords or nil,
-                                    vocabulary = frozenVocabularyText,
-                                    photoFacts = props.usePhotoFacts and photoFacts or nil,
-                                    excludeKeys = excludeSet
-                                }, props.useCurrentData, props.useSystemPrompt, props.model)
-                                -- One automatic retry when the reply comes back broken
-                                if apiResponse or errKind ~= "badjson" then
-                                    break
-                                end
-                                logger:warn("Invalid JSON reply, retrying once")
-                                props.status = "Retrying..."
-                            end
-
-                            if not apiResponse then
-                                showError(err)
-                                return
-                            end
-
-                            -- A blank title or caption never replaces the current one
-                            if type(apiResponse.title) == "string" and apiResponse.title:match("%S") then
-                                props.title = apiResponse.title
-                            end
-                            if type(apiResponse.caption) == "string" and apiResponse.caption:match("%S") then
-                                props.caption = apiResponse.caption
-                            end
-                            -- Convert keywords array to comma-separated string for display
-                            if apiResponse.keywords and type(apiResponse.keywords) == "table" then
-                                props.keywords = table.concat(filterKeywords(apiResponse.keywords, excludeSet, vocabulary), ", ")
-                            else
-                                props.keywords = ""
-                            end
-                            props.elapsed = string.format("%d s", math.floor(LrDate.currentTime() - startTime + 0.5))
-                            props.status = "Ready"
-                            props.statusColor = LrColor(0.149, 0.616, 0.412)
-                        end
-
-                        LrTasks.startAsyncTask(function()
-                            local ok, problem = LrTasks.pcall(generate)
-                            if not ok then
-                                showError("Something went wrong: " .. tostring(problem))
-                            end
-                            -- Always turn the button back on, even after an error
-                            props.canGenerate = true
-                        end)
-                    end
-                }},
-                f:spacer{
-                    height = 20
-                },
-                width = 400
-            }}
-        }
-
-        -- Show the dialog
         local result = LrDialogs.presentModalDialog({
             title = "Lightroom Llama",
             contents = c,
@@ -1404,7 +1347,6 @@ local function main()
             }
         })
 
-
         -- The preview thumbnail is no longer needed
         if thumbnailPath then
             LrFileUtils.delete(thumbnailPath)
@@ -1413,7 +1355,7 @@ local function main()
         if result == "ok" then
             -- The photo's current 'llm' keywords, read before saving so any
             -- no longer in the Keywords box can be removed from the photo
-            local oldLlmKeywords = getLlmKeywordObjects(selectedPhoto)
+            local oldLlmKeywords = sortKeywords(selectedPhoto:getRawMetadata("keywords")).llm
             local removedCount = 0
 
             -- Save the metadata to the photo

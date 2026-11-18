@@ -15,6 +15,8 @@ First release of this fork, compared with the original plugin. Most changes are 
 - **Request timeouts.** Each request may take up to 180 seconds (`requestTimeout`). A timeout is reported as such, not as "Ollama isn't running".
 - **Broken or runaway replies.** Replies are capped at 600 tokens (`maxReplyTokens`) with a mild repetition penalty, so a model stuck repeating itself stops quickly. A broken or empty reply is retried once automatically, and the log records why it failed.
 - **Thinking switched off.** Requests ask Ollama to turn off step-by-step "thinking" (Gemma 4, Qwen thinking builds), which could use up the whole reply and leave the answer empty. Models without a thinking mode that reject the setting are retried without it.
+- **No pop-up mid-batch if a thumbnail can't be read.** The failure is logged and reported in the usual way (the photo is listed as failed) instead of stopping on an extra error message.
+- **Missing title or caption treated as empty** in the single-photo dialog, as batch mode already did, so "Use current title and caption" starts unticked for a photo that has neither.
 - **Temporary thumbnails deleted** after each request and when the single-photo dialog closes.
 - **Log location comment updated** for Lightroom Classic 14 and later:
   - macOS: `~/Library/Logs/Adobe/Lightroom/LrClassicLogs/LrLlama.log`
@@ -32,10 +34,11 @@ First release of this fork, compared with the original plugin. Most changes are 
 
 ### Prompt
 
-- **Rewritten system prompt.** About a third of the original length, sample sunset-and-beach answer removed, asks for English.
+- **Rewritten system prompt.** About a third of the original length, sample sunset-and-beach answer removed, asks for English. It is always sent: the "Use system prompt" checkbox has been removed from both dialogs.
+- **Additional prompt text.** The Prompt box is now "Additional prompt text (optional)" and is empty by default. The task itself ("Caption the photo you are given") is in the system prompt; anything typed in the box is added at the end of the request. If the request would otherwise be empty, "Caption this photo." is sent, as Ollama gives no answer to an empty prompt.
 - **Caption guidance:**
   - order: main subject and action, then setting, then light, weather or time of day, then mood
-  - concrete visual details; words like "stunning", "beautiful", "breathtaking", "captivating" and "serene" discouraged
+  - concrete visual details (light, textures, composition); words like "stunning", "beautiful", "breathtaking", "captivating" and "serene" discouraged
   - present tense, third person; no openings like "This image shows" or "The photo captures"
   - adds something the title doesn't say
   - works given names, places and events in naturally
@@ -48,10 +51,11 @@ First release of this fork, compared with the original plugin. Most changes are 
   - The model treats them as verified facts and does not repeat them.
 - **Date and location as context.** When the photo was taken, and its location, city, state and country fields, are given to the model as accurate background facts for season, time of day and place names in the title and caption. A checkbox in each dialog, on by default when the photo has them.
 - **Place names kept out of keywords.** The photo's location, city, state and country are background only: the prompt asks the model not to use them as keywords, and any keyword matching one of them is dropped in code. Generic place words such as "park" or "lake" are still given. In single-photo mode you can still type a place name into the Keywords box yourself.
-- **Keyword categories.** The model is asked to cover, where they apply: main subject; type of photo (always one, so a portrait gets both "woman" and "portrait"); clothing style (one keyword for the whole outfit, such as "casual clothing"); notable objects; setting and place; season and weather; time of day and light; action or pose; mood or concept.
+- **Keyword categories.** The model is asked to cover, where they apply: main subject or subjects; type of photo (always one, so a portrait gets both "woman" and "portrait"); clothing style (one general keyword for the whole outfit, such as "casual clothing"); notable objects; setting and place; season and weather; time of day and light; action or pose; mood or concept.
 - **Keyword rules** (under their own heading): 7 to 15 keywords, not counting names of people or places the model was given; every main person, animal and object also a keyword, but nothing small or far away in the background even if the caption mentions it (someone searching for a dog wouldn't want a photo with a tiny dog in the distance), repeated as a final check at the end; for a named person also the general word (woman, man, child) and for a named place the type of place (park, lake, beach) instead of its name; singular nouns, lower case except names, one keyword per idea (no variants, and no more detailed version of a keyword already given, such as "autumn colours" next to "autumn"), no padding words such as "setting", "scene", "view" or "area", no camera details or generic words.
+- **Grounding.** The prompt ends by asking the model to describe only what is visible or given as fact, and not to invent names of people or places, or dates.
 - **What not to give as keywords:**
-  - a colour on its own because one object has that colour; a notable colour is joined to its object ("orange sunglasses"), and a lone colour is only for the main colour or tone of the whole image
+  - a colour on its own because one object has that colour; an object's colour is mentioned only when it stands out, joined to the object ("orange sunglasses"), and a lone colour is only for the main colour or tone of the whole image
   - the material, texture, size, shape or pattern of a single object ("wooden", "small", "striped"), or body parts in an ordinary photo of a person, unless they are the subject
   - single items of clothing or accessories worn by a person ("jeans", "belt", "top"); one clothing style keyword covers the outfit, and an item gets its own keyword only when the photo is about it or it stands out (a costume, a uniform, a bright red coat)
   - counts such as "two" or "pair"
@@ -72,22 +76,25 @@ First release of this fork, compared with the original plugin. Most changes are 
 ### Single-photo dialog
 
 - **Timer.** Generation time in whole seconds, shown in blue to the right of the Model box after each successful run.
-- **Preview prompt.** A checkbox under the photo (off by default) showing a read-only, scrollable view of exactly what will be sent. It reflects the Prompt box and all checkboxes, and updates as you type in the Prompt box.
+- **Preview prompt.** A checkbox under the photo (off by default) showing a read-only, scrollable view of exactly what will be sent. It reflects the Additional prompt text box, the Title, Caption and existing keywords boxes, and all checkboxes, and updates as you type in any of them. Tall enough to show the full system prompt without cutting it off.
 - **Use date and location** checkbox, showing the details found for the photo.
 - **Save matches the Keywords box.** Save adds the keywords in the box under `llm` and removes any `llm` keywords on the photo that are no longer in the box (for example after Generate replaced the list, or you deleted one). Duplicate variants already on the photo (such as "tree" and "trees") are cut down to the one kept. Removed keywords stay in the catalog until purged.
 - **Blank results ignored.** An empty title or caption from the model no longer clears the box.
+- **"Use current title and caption" ignored when both boxes are empty,** as in batch mode, so the model isn't told the photo already has a title and caption when it doesn't.
+- **Thumbnail reused.** Generate sends the thumbnail already made for the dialog instead of making a new one each time.
 - **Generate and Save disabled while generating,** so a second click can't start a competing request and Save can't store the old text while a new reply is on its way.
 - **Save errors reported.** If Lightroom can't save (for example the catalog is busy), a message says so instead of Lightroom's raw error.
 
 ### Batch mode (new)
 
 - Used automatically when more than one photo is selected.
-- **Dialog:** prompt, "Use each photo's current title and caption", "Use each photo's existing keywords as context", "Use each photo's date and location", "Skip photos that already have a caption", "Use system prompt", editable Model box.
+- **Dialog:** additional prompt text, "Use each photo's current title and caption", "Use each photo's existing keywords as context", "Use each photo's date and location", "Skip photos that already have a caption", editable Model box.
 - **Keywords for this batch:** given to the model as context for every photo. With "Also add these keywords to every photo" ticked (default), they are also added to each photo as your own top-level keywords, not under `llm`.
 - **Running:**
   - progress bar with cancel
   - each photo saved as its own Undo step
-  - a blank result never wipes an existing title or caption
+  - every photo's title, caption, keywords, date, location and file name read from the catalog in two calls at the start, rather than several calls per photo (falls back to reading each photo if that fails)
+  - a blank result (empty or only spaces) never wipes an existing title or caption
   - a photo that times out or returns a broken reply is retried once
   - a photo that hits an unexpected error is listed as failed and the batch carries on, instead of stopping with Lightroom's raw error
   - stops at the first photo if Ollama can't be reached or the model is missing, or after 3 timeouts in a row

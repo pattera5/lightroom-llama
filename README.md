@@ -64,11 +64,11 @@ After updating the plugin files, select the plugin in the Plug-in Manager and cl
 
 Select one photo and choose **Library > Plug-in Extras > Lightroom Llama...**
 
-1. Optionally edit the prompt and options:
+1. Optionally set the options:
+   - **Additional prompt text:** empty by default; anything typed here is added to the end of the request, for example "Mention the lighthouse" or "Keep the caption short". The writing guidelines themselves are always sent.
    - **Use current title and caption:** the model improves on the existing ones and keeps their names and facts
    - **Use existing keywords as context:** pre-filled with the photo's own keywords; edit the list to add hints such as a place or a person's name
    - **Use date and location:** shows when and where the photo was taken, from its metadata; greyed out if none is recorded. These are background for the title and caption: place names such as the city or state are not added as keywords (generic words such as "park" still are).
-   - **Use system prompt:** the full writing guidelines (recommended)
    - **Model:** any installed Ollama vision model
 2. Click **Generate**. The button is greyed out until the reply arrives, then the time taken appears in blue next to the Model box. A blank title or caption in the reply leaves the current one in place.
 3. Review and edit the title, caption and keywords, then click **Save**. The photo's `llm` keywords are set to exactly what is in the Keywords box: any you removed from the box are removed from the photo, and duplicate variants already on it (such as "tree" and "trees") are cut down to one. Save is greyed out while Generate is running.
@@ -79,7 +79,7 @@ Tick **Preview prompt** under the photo to see exactly what will be sent to the 
 
 Select more than one photo and choose the same menu item.
 
-1. Set the prompt and options (they apply to every photo, but each photo uses its own title, caption, keywords, date and location). Tick **Skip photos that already have a caption** to process only new photos.
+1. Set the options and any additional prompt text (they apply to every photo, but each photo uses its own title, caption, keywords, date and location). Tick **Skip photos that already have a caption** to process only new photos.
 2. Optionally enter **Keywords for this batch**, such as an event or place. These are given to the model as facts for every photo. With **Also add these keywords to every photo** ticked, they are also added to each photo as your own keywords.
 3. Click **Generate**. Each photo is captioned and saved straight away.
 
@@ -95,10 +95,10 @@ Notes:
 
 - Keywords already on a photo are never repeated under `llm`.
 - Place names from the photo's location, city, state and country fields are not added as keywords; they are used in the title and caption only.
-- The model is asked to cover main subject, type of photo (always one, such as portrait or landscape), clothing style (one keyword for the outfit), notable objects, setting, season and weather, time of day and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped. Your own keywords and place names don't count towards the 7 to 15, as they are removed anyway.
+- The model is asked to cover main subject or subjects, type of photo (always one, such as portrait or landscape), clothing style (one general keyword for the outfit), notable objects, setting, season and weather, time of day and light, action or pose, and mood, with 7 to 15 keywords. Anything past 15 is dropped. Your own keywords and place names don't count towards the 7 to 15, as they are removed anyway.
 - For a named person the model also gives the general word (woman, man, child), and for a named place the type of place (park, lake, beach), so the photo can be found both ways.
 - The model is asked to describe things, not their properties:
-  - no colour on its own because one object has that colour; a notable colour is joined to its object ("orange sunglasses", not "orange"), and a colour on its own is only for the main colour or tone of the whole image
+  - no colour on its own because one object has that colour; an object's colour is mentioned only when it stands out, joined to the object ("orange sunglasses", not "orange"), and a colour on its own is only for the main colour or tone of the whole image
   - no material, texture, size, shape or pattern of a single object ("wooden", "small", "striped"), and no body parts in an ordinary photo of a person, unless they are the subject
   - no single items of clothing or accessories ("jeans", "belt") unless the photo is about them or they stand out; one clothing style keyword ("casual clothing") instead
   - no small or distant background details, even when the caption mentions them, and no more detailed repeat of a keyword already given ("autumn colours" next to "autumn")
