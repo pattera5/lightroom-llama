@@ -14,7 +14,7 @@
   <a href="#license">License</a>
 </p>
 
-> This is a fork of [thejoltjoker/lightroom-llama](https://github.com/thejoltjoker/lightroom-llama), maintained at [pattera5/lightroom-llama](https://github.com/pattera5/lightroom-llama). It adds batch processing, keyword de-duplication, better error handling and a reworked prompt. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
+> This is a fork of [thejoltjoker/lightroom-llama](https://github.com/thejoltjoker/lightroom-llama), maintained at [pattera5/lightroom-llama](https://github.com/pattera5/lightroom-llama). It adds batch processing, keyword de-duplication, a keyword clean-up tool (LL Optimize Keywords), better error handling and a reworked prompt. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
 
 ## Key Features
 
@@ -24,6 +24,7 @@
 - **Batch mode** to caption many photos in one run, with a progress bar and cancel
 - **Uses what you already know about a photo:** existing title, caption, keywords, capture date and location are given to the model as facts, so captions name the right people, places, seasons and events
 - **Keeps your keyword list tidy:** merges near-duplicates such as "outdoor", "outdoors" and "outdoor setting" into your existing keywords
+- **LL Optimize Keywords** merges `llm` keywords that mean the same thing (kids and children, outdoor event and event) across the whole catalog, after you review each merge, and remembers your decisions in a substitution list
 - Generated keywords are filed under an `llm` parent keyword, so they are easy to find, review or remove
 - Choose any Ollama vision model from the dialog, without editing code
 - Prompt preview and generation timer to help you tune results
@@ -45,6 +46,8 @@
 4. Start Ollama: `ollama serve` (or open the Ollama app)
 5. Download the default model: `ollama pull qwen3-vl:4b-instruct`
 
+LL Optimize Keywords uses the same model by default. Its task is text only, so it can also use a model that can't read images.
+
 Other vision models work too, for example `qwen3-vl:8b-instruct`, `gemma4:e4b`, `gemma4:12b` or `gemma3:12b`. Use the `-instruct` versions of Qwen models; the plain tags are "thinking" builds and are much slower.
 
 For the latest instructions on installing and running Ollama, see [the Ollama repository](https://github.com/ollama/ollama).
@@ -58,7 +61,9 @@ For the latest instructions on installing and running Ollama, see [the Ollama re
 5. Navigate to the downloaded plugin folder and select the `.lrplugin` folder
 6. Click "Done" to close the Plug-in Manager
 
-After updating the plugin files, select the plugin in the Plug-in Manager and click **Reload Plug-in**.
+To update, replace the plugin files, then select the plugin in the Plug-in Manager and click **Reload Plug-in**. If the new version adds files (2.1.0 does), restart Lightroom instead: **Reload Plug-in** only re-reads files Lightroom already knows about.
+
+The plugin adds two menu items: **Lightroom Llama...** (in **Library > Plug-in Extras** and **File > Plug-in Extras**) and **LL Optimize Keywords...** (in **Library > Plug-in Extras**).
 
 ### Single-photo mode
 
@@ -70,7 +75,7 @@ Select one photo and choose **Library > Plug-in Extras > Lightroom Llama...**
    - **Use existing keywords as context:** pre-filled with the photo's own keywords; edit the list to add hints such as a place or a person's name
    - **Use date and location:** shows when and where the photo was taken, from its metadata; greyed out if none is recorded. These are background for the title and caption: place names such as the city or state are not added as keywords (generic words such as "park" still are).
    - **Model:** any installed Ollama vision model
-2. Click **Generate**. The button is greyed out until the reply arrives, then the time taken appears in blue next to the Model box. A blank title or caption in the reply leaves the current one in place.
+2. Click **Generate**. The button is greyed out until the reply arrives, then the time taken appears in blue next to the Model box. A blank title or caption in the reply leaves the current one in place. A request that times out or returns a broken reply is retried once automatically (the status shows "Retrying...").
 3. Review and edit the title, caption and keywords, then click **Save**. The photo's `llm` keywords are set to exactly what is in the Keywords box: any you removed from the box are removed from the photo, and duplicate variants already on it (such as "tree" and "trees") are cut down to one. Save is greyed out while Generate is running.
 
 Tick **Preview prompt** under the photo to see exactly what will be sent to the model.
@@ -81,7 +86,7 @@ Select more than one photo and choose the same menu item.
 
 1. Set the options and any additional prompt text (they apply to every photo, but each photo uses its own title, caption, keywords, date and location). Tick **Skip photos that already have a caption** to process only new photos.
 2. Optionally enter **Keywords for this batch**, such as an event or place. These are given to the model as facts for every photo. With **Also add these keywords to every photo** ticked, they are also added to each photo as your own keywords.
-3. Click **Generate**. Each photo is captioned and saved straight away.
+3. Click **Generate for N photos**. Each photo is captioned and saved straight away, with a progress bar you can cancel.
 
 Notes:
 - Each photo is saved as its own step, so recent ones can be reverted with Edit > Undo.
@@ -111,7 +116,62 @@ Notes:
 - A keyword containing commas, such as "Oslo, Norway", is split into separate keywords.
 - Em dashes (and dashes used between clauses) are removed from titles and captions.
 
-To clean up old duplicate keywords, remove them from your photos and choose **Metadata > Purge Unused Keywords**.
+### LL Optimize Keywords
+
+**Library > Plug-in Extras > LL Optimize Keywords...** tidies the `llm` keywords already in your catalog by merging those that mean the same thing (kids and children, outdoor event and event). It works on the whole catalog, so no photos need to be selected, and it only ever changes `llm` keywords.
+
+A merge moves the photos from one keyword to another: photos tagged "kids" get "children" instead. The emptied keyword stays in the catalog with no photos, and its name is added as a synonym of the kept keyword, so searching for "kids" still finds the photos. Applying the substitution list and merging the reviewed groups are separate Undo steps (creating a missing To keyword is one more).
+
+#### Start dialog
+
+- **What to run:** apply the substitution list, then look for new keywords to merge; or apply the substitution list only.
+- **Model:** the Ollama model used to find synonyms, for this run only (not saved). Any installed model works, as this is a text-only task.
+- **Edit substitution list...** opens the list editor (see below).
+
+#### Step 1: the substitution list
+
+The substitution list is a set of From -> To rows, such as kids -> children. It is applied first, after a confirmation listing the keywords that will be replaced.
+
+- Capitals are ignored, and chains are followed (tots -> kids and kids -> children turn tots into children).
+- If the To keyword doesn't exist yet, it is created under `llm`.
+- Every merge you approve in step 2 is added to the list, so the same words are replaced automatically next time. Approving the opposite merge later (children -> kids) replaces the old row.
+
+Edit the list with **Edit substitution list...**, in the start dialog or in **File > Plug-in Manager > Lightroom Llama**. The editor has two columns, From and To:
+
+- Type into the empty rows at the bottom. **Add rows** gives you five more (the window briefly closes and reopens, keeping what you typed; Lightroom can't add rows to an open window).
+- To delete a row, clear both boxes.
+- Nothing is saved until you click **Save**. Rows with only one side filled in are pointed out before saving.
+
+#### Step 2: finding new matches
+
+Every `llm` keyword that is on at least one photo is compared in four ways:
+
+| Method | Finds | Starts |
+|---|---|---|
+| Same word | Keywords that are equal ignoring capitals, plurals and filler words (tree/trees, forest/forest scene) | Ticked |
+| Synonym list | Pairs in the plugin's built-in list (kids/children, bike/bicycle, colour/color) | Ticked |
+| Longer form | A keyword that is another keyword plus one extra word at the start or end (outdoor event/event, pushing motion/pushing, wooden fence/fence) | Ticked when the extra word is a padding word (outdoor, wooden, metal, motion...); otherwise unticked (smiling woman/woman) |
+| Ollama | Synonyms suggested by the model (forest/woods, life vest/life jacket, noon/midday) | Ticked; unticked if the model's suggestions form a group of more than 4 keywords, or if a pair couldn't be checked |
+
+About the Ollama step:
+
+- The model is sent the list of keywords and asked for replacement pairs. It is told not to pair different people, objects, actions or feelings, and to leave longer forms to the check above.
+- Each pair it suggests is then **checked with a separate yes/no question** ("do these two keywords mean the same thing?"). A small model answers one pair far more reliably than it writes the list: in testing, this rejected every wrong pair (black t-shirt/black shorts, tree/hedge, barn/house) and took 43 seconds for 132 pairs. It is a little strict, so a few real synonyms may be rejected; add those to the substitution list.
+- If the model's reply is cut off (small models sometimes repeat themselves until they run out of room), the pairs it completed are still used.
+- If Ollama can't be reached, the other three methods are still used and the dialog says so.
+- A keyword that could be read as a longer form two ways (casual clothing: casual or clothing) is not offered.
+
+#### Review and merge
+
+A dialog lists each group with photo counts, how it was found, a tick box and a **Keep** menu:
+
+- Groups that start unticked say "Not ticked: check before merging". **Tick all** and **Untick all** are at the top.
+- The keyword to keep is chosen in this order: a spelling you already use outside `llm`; a shorter form contained in another keyword of the group (obstacle course rather than outdoor obstacle course); the keyword on the most photos. When two are still tied, the menu says "Choose one..." and the group is only merged once you pick.
+- Click **Merge** to merge the ticked groups.
+
+The log lists everything the run did: the keywords sent to the model (with photo counts), the model's reply, each rejected pair, each oversized group and each merge.
+
+To remove the emptied keywords afterwards, choose **Metadata > Purge Unused Keywords**. The synonyms stored on the kept keywords are not affected.
 
 ## Configuration
 
@@ -126,7 +186,21 @@ Settings at the top of `LrLlama.lua`:
 | `maxReplyTokens` | `600` | Most tokens a reply may use, so a model stuck repeating itself stops quickly |
 | `offerVocabularyToModel` | `false` | List your existing `llm` keywords in the prompt. Small models tend to copy unrelated keywords from it, so leave off unless using a larger model. |
 
-Requests also keep the model loaded for 30 minutes, use a temperature of 0.3, fix the context size at 8,192 tokens and switch off "thinking".
+Requests also keep the model loaded for 30 minutes, use a temperature of 0.3 and a mild repetition penalty (1.1), fix the context size at 8,192 tokens and switch off "thinking".
+
+Settings at the top of `LrOptimizeKeywords.lua` (LL Optimize Keywords):
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `model` | `qwen3-vl:4b-instruct` | Default model asked which keywords are synonyms; can be changed in the start dialog |
+| `requestTimeout` | `180` | Seconds to wait for Ollama's answer |
+| `maxKeywordsForOllama` | `1500` | Most keywords sent to the model (most-used first), to fit its context size |
+| `maxOllamaGroupSize` | `4` | Largest group the model's suggestions may form before it starts unticked |
+| `checkOllamaPairs` | `true` | Check each pair Ollama suggests with a separate yes/no question before offering it |
+| `paddingWords` | outdoor, wooden, motion... | Extra words that make a longer form start ticked (outdoor event -> event) |
+| `synonymGroups` | short list | Words that always count as the same (kids/children, bike/bicycle) |
+
+The substitution list is kept in Lightroom's plug-in preferences and edited with **Edit substitution list...**, not in a file.
 
 ## Troubleshooting
 
@@ -145,6 +219,9 @@ Watch it live on macOS with `tail -f ~/Library/Logs/Adobe/Lightroom/LrClassicLog
 | The model's reply wasn't valid JSON / was cut off | The model broke format or got stuck repeating itself. Retried once automatically; the full reply is in the log. |
 | Ollama returned an empty response / spent its whole reply thinking | The model's "thinking" used up the reply. Use a non-thinking model, such as an `-instruct` build. |
 | Could not save to the photo | Lightroom was busy (for example another plugin or a sync was writing to the catalog). Click Save again in a moment. |
+| No script by the name ... (in the plug-in error log) | A new version added files that Lightroom hasn't seen yet. **Reload Plug-in** doesn't pick up new files: restart Lightroom, or remove the plugin in the Plug-in Manager and add it again. |
+| LL Optimize Keywords: Ollama was not used | Ollama couldn't be reached or gave no usable answer. The same-word, synonym-list and longer-form matches are still shown; the reason is in the dialog and the log. |
+| LL Optimize Keywords: the model's reply was cut off | The model ran out of room, usually by repeating itself. The pairs it completed are still used. |
 
 **Place names missing:** the plugin reads Lightroom's location, city, state and country fields, not raw GPS. Fill those fields from the Map module first.
 
@@ -158,9 +235,20 @@ Watch it live on macOS with `tail -f ~/Library/Logs/Adobe/Lightroom/LrClassicLog
 - [ ] Add customizable prompt templates
 - [ ] Create settings panel for model configuration
 - [x] Clean up temporary thumbnail files
-- [ ] Merge true synonyms (for example "woods" and "forest")
-- [ ] Tool to merge duplicate `llm` keywords already in the catalog
+- [x] Merge true synonyms (for example "woods" and "forest")
+- [x] Tool to merge duplicate `llm` keywords already in the catalog (LL Optimize Keywords)
 - [ ] Put processed batch photos in a review collection
+- [ ] Stop merged keywords coming back: Lightroom Llama doesn't yet apply the substitution list when it generates keywords, so a merged keyword ("kids", merged into "children") can be added to new photos again. It also reuses the emptied keyword, as it still exists in the catalog with no photos. To do after the substitution logic is refined.
+- [ ] Open the single-photo dialog faster: it currently asks Lightroom for the photos on every `llm` keyword (about 400 calls) just to sort existing spellings by use
+- [ ] Let the substitution list hold keywords containing `;` or `->` (at the moment these characters act as separators when the list is saved)
+- [ ] At generation, save a keyword as the `llm` keyword it is a synonym of (merges record "kids" as a synonym of "children"), and ignore `llm` keywords with no photos when matching
+- [ ] LL Optimize Keywords: remember groups left unticked ("keep apart" list) so they aren't offered again on every run
+- [ ] LL Optimize Keywords: skip asking the model when the keyword list hasn't changed since the last run
+- [ ] LL Optimize Keywords: don't check pairs the code already linked (same word, synonym list)
+- [ ] LL Optimize Keywords: check each pair in both orders and keep it if either answer is yes (finds more real synonyms, about twice the checking time)
+- [ ] LL Optimize Keywords: try a larger model (such as gemma3:12b) for finding synonyms
+- [ ] LL Optimize Keywords: edit the built-in synonym list and padding words in the Plug-in Manager (perhaps as starting entries of the substitution list)
+- [ ] LL Optimize Keywords: sort the review dialog, ticked groups first, then by photo count
 - [ ] Decide whether single-photo Save should keep an `llm` keyword that has the same name as one of your own keywords on the photo (at the moment the `llm` copy is removed)
 
 ## Credits

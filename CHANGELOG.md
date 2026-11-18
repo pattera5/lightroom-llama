@@ -1,5 +1,38 @@
 # Lightroom Llama: changelog
 
+## 2.1.0 (18 November 2026)
+
+Adds LL Optimize Keywords, a second tool that tidies the `llm` keywords already in the catalog. Lightroom Llama works as before apart from two small changes listed below; its keyword matching code moved, unchanged, to `KeywordMatch.lua` so both tools share it. After updating, restart Lightroom (or remove and re-add the plugin), as this version adds new files that **Reload Plug-in** doesn't pick up.
+
+### LL Optimize Keywords (new)
+
+**Library > Plug-in Extras > LL Optimize Keywords...** merges `llm` keywords that mean the same thing, across the whole catalog. No photos need to be selected.
+
+- **Merging.** Photos with a merged keyword get the kept keyword instead. The merged keyword stays in the catalog with no photos, and its name (with any synonyms it had) is added as a synonym of the kept keyword, so searching for it still finds the photos. Keywords outside `llm` are never changed. Applying the substitution list and merging the reviewed groups are separate Undo steps.
+- **Start dialog.** Choose between applying the substitution list and then looking for new matches, or the substitution list only. Has a Model box (for this run only, not saved; default `qwen3-vl:4b-instruct`) and an **Edit substitution list...** button.
+- **Substitution list.** From -> To keyword replacements, applied first after a confirmation listing the changes. Chains are followed (tots -> kids -> children) and loops ignored; a missing To keyword is created under `llm`. Every merge approved in the review dialog is added to the list, replacing any row it contradicts. Stored in the plug-in preferences.
+- **Substitution list editor.** A two-column (From / To) window, opened from the start dialog or from **File > Plug-in Manager > Lightroom Llama**. Empty rows to type into, **Add rows** for five more, clear both boxes to delete a row, Save / Cancel; rows with only one side filled in are pointed out before saving.
+- **Finding new matches.** Every `llm` keyword on at least one photo is compared in four ways:
+  - same word: equal ignoring capitals, plurals and filler words (tree/trees, forest/forest scene)
+  - synonym list: a short, editable list at the top of `LrOptimizeKeywords.lua` (`synonymGroups`: kids/children, bike/bicycle, colour/color)
+  - longer forms: a keyword that is another keyword plus one extra word at the start or end (outdoor event/event, pushing motion/pushing). Starts ticked when the extra word is a padding word (`paddingWords`: outdoor, wooden, metal, motion...), otherwise unticked, and then only when the longer keyword isn't already in another group. Keywords that can be read two ways (casual clothing) are skipped.
+  - Ollama: the model is sent the keyword list (up to 1,500, most-used first) and asked for replacement pairs: synonyms, British and American spellings, short and long forms. It is told not to pair different people, kinds or parts of something, objects, actions or feelings.
+- **Checking the model's suggestions.** Each pair the model suggests is checked with a separate yes/no question before it is offered (`checkOllamaPairs`). Asking for the list alone paired different things (black t-shirt/black shorts, tree/hedge, barn/house); in testing, checking one pair at a time rejected all of those, taking 43 seconds for 132 pairs. Rejected pairs are logged; a pair that couldn't be checked starts unticked. The progress bar shows each pair and can be cancelled.
+- **Robust to small-model problems.** Asking for pairs rather than groups stops the model lumping a whole topic (people, actions) into one group. Requests use `repeat_penalty 1.1`; if a reply is still cut off, the pairs it completed are used and the dialog says so. A group of more than 4 keywords built from the model's pairs (`maxOllamaGroupSize`) starts unticked. If Ollama can't be reached, the other three methods are still used.
+- **Review dialog.** Each group is listed with photo counts, how it was found, a tick box and a **Keep** menu, with **Tick all** and **Untick all**. Only ticked groups are merged.
+- **Which keyword is kept.** By default: a spelling you already use outside `llm`; then a shorter form contained in another keyword of the group (obstacle course over outdoor obstacle course); then the one on the most photos. If two are still tied, you choose.
+- **Logging.** The log records the keywords sent to the model (with photo counts), its reply, each rejected pair, each oversized group, each skipped two-way longer form and each merge.
+
+### Lightroom Llama
+
+- **Single-photo dialog retries a timeout.** A request that times out is now retried once, as in batch mode (previously only a broken reply was).
+- **Batch dialog titles** are now "Lightroom Llama: Batch" and "Lightroom Llama: Batch finished", without a dash.
+
+### Project files
+
+- **New:** `LrOptimizeKeywords.lua` (the tool), `KeywordMatch.lua` (keyword matching shared by both tools, moved unchanged from `LrLlama.lua`), `Substitutions.lua` (reading and updating the substitution list), `SubstitutionEditor.lua` (the list editor), `PluginInfoProvider.lua` (the Plug-in Manager section).
+- **`Info.lua`:** version 2.1.0, the new menu item, the Plug-in Manager section, and a description mentioning the new tool.
+
 ## 2.0.0 (17 November 2026)
 
 First release of this fork, compared with the original plugin. Most changes are to `LrLlama.lua`. `JSON.lua` is unchanged.
@@ -13,7 +46,7 @@ First release of this fork, compared with the original plugin. Most changes are 
 - **Empty title or caption** no longer breaks the prompt.
 - **JSON fallback.** If a model doesn't support Ollama's JSON mode ("structured output is unavailable"), the request is retried without it, and the JSON is extracted from the reply, ignoring surrounding text, code fences or `<think>` blocks.
 - **Request timeouts.** Each request may take up to 180 seconds (`requestTimeout`). A timeout is reported as such, not as "Ollama isn't running".
-- **Broken or runaway replies.** Replies are capped at 600 tokens (`maxReplyTokens`) with a mild repetition penalty, so a model stuck repeating itself stops quickly. A broken or empty reply is retried once automatically, and the log records why it failed.
+- **Broken or runaway replies.** Replies are capped at 600 tokens (`maxReplyTokens`) with a mild repetition penalty, so a model stuck repeating itself stops quickly. A broken or empty reply, or a request that timed out, is retried once automatically in both dialogs, and the log records why it failed.
 - **Thinking switched off.** Requests ask Ollama to turn off step-by-step "thinking" (Gemma 4, Qwen thinking builds), which could use up the whole reply and leave the answer empty. Models without a thinking mode that reject the setting are retried without it.
 - **No pop-up mid-batch if a thumbnail can't be read.** The failure is logged and reported in the usual way (the photo is listed as failed) instead of stopping on an extra error message.
 - **Missing title or caption treated as empty** in the single-photo dialog, as batch mode already did, so "Use current title and caption" starts unticked for a photo that has neither.
@@ -35,6 +68,8 @@ First release of this fork, compared with the original plugin. Most changes are 
 ### Prompt
 
 - **Rewritten system prompt.** About a third of the original length, sample sunset-and-beach answer removed, asks for English. It is always sent: the "Use system prompt" checkbox has been removed from both dialogs.
+- **Title guidance:** one sentence or phrase, like a news headline, covering who, what, where and the mood; the angle or perspective when notable; no colons, keyword lists or repeated words.
+- **Current title and caption.** When "Use current title and caption" is ticked, the model is told to improve on them while keeping their meaning and any names, places and facts.
 - **Additional prompt text.** The Prompt box is now "Additional prompt text (optional)" and is empty by default. The task itself ("Caption the photo you are given") is in the system prompt; anything typed in the box is added at the end of the request. If the request would otherwise be empty, "Caption this photo." is sent, as Ollama gives no answer to an empty prompt.
 - **Caption guidance:**
   - order: main subject and action, then setting, then light, weather or time of day, then mood
@@ -108,7 +143,9 @@ First release of this fork, compared with the original plugin. Most changes are 
 
 ## Known limitations
 
-- True synonyms (for example "woods" and "forest") are not merged.
+- True synonyms (for example "woods" and "forest") are not merged when keywords are generated; run LL Optimize Keywords afterwards to merge them. The substitution list is not yet applied when keywords are generated, so a keyword merged by LL Optimize Keywords can be added to new photos again.
+- LL Optimize Keywords: the model's check of each pair is a little strict (it rejected woodland/forest and path/trail in testing) and can depend on word order. Add pairs it misses to the substitution list.
+- LL Optimize Keywords: longer forms are only found for one extra word at the start or end of another keyword.
 - Words sharing a root may still be merged when the meaning differs, unless they are in the plugin's list of exceptions.
 - Photos with GPS coordinates but empty location fields get no place name; fill the fields from Lightroom's Map module first.
 - The capture time comes from the camera clock, so it is wrong if the camera was set wrong.
